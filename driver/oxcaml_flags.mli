@@ -38,6 +38,8 @@ val x86_peephole_remove_redundant_extension : bool ref
 val x86_peephole_combine_add_rsp : bool ref
 val x86_peephole_remove_redundant_test : bool ref
 
+val cmm_strength_reduction : bool ref
+
 val cfg_stack_checks : bool ref
 val cfg_stack_checks_threshold : int ref
 

@@ -152,6 +152,16 @@ let mk_no_cfg_zero_alloc_checker f =
     Arg.Unit f,
     " Do not apply zero_alloc checker to CFG" )
 
+let mk_cmm_strength_reduction f =
+  ( "-cmm-strength-reduction",
+    Arg.Unit f,
+    " Carry loop-invariant array indices in loop parameters" )
+
+let mk_no_cmm_strength_reduction f =
+  ( "-no-cmm-strength-reduction",
+    Arg.Unit f,
+    " Recompute loop-invariant array indices on every iteration" )
+
 let mk_cfg_stack_checks f =
   ( "-cfg-stack-checks",
     Arg.Unit f,
@@ -1337,6 +1347,8 @@ module type Oxcaml_options = sig
   val no_x86_peephole_remove_redundant_extension : unit -> unit
   val no_x86_peephole_combine_add_rsp : unit -> unit
   val no_x86_peephole_remove_redundant_test : unit -> unit
+  val cmm_strength_reduction : unit -> unit
+  val no_cmm_strength_reduction : unit -> unit
   val cfg_stack_checks : unit -> unit
   val no_cfg_stack_checks : unit -> unit
   val cfg_stack_checks_threshold : int -> unit
@@ -1533,6 +1545,8 @@ module Make_oxcaml_options (F : Oxcaml_options) = struct
       mk_no_x86_peephole_combine_add_rsp F.no_x86_peephole_combine_add_rsp;
       mk_no_x86_peephole_remove_redundant_test
         F.no_x86_peephole_remove_redundant_test;
+      mk_cmm_strength_reduction F.cmm_strength_reduction;
+      mk_no_cmm_strength_reduction F.no_cmm_strength_reduction;
       mk_cfg_stack_checks F.cfg_stack_checks;
       mk_no_cfg_stack_checks F.no_cfg_stack_checks;
       mk_cfg_stack_checks_threshold F.cfg_stack_checks_threshold;
@@ -1884,6 +1898,8 @@ module Oxcaml_options_impl = struct
   let no_x86_peephole_remove_redundant_test =
     clear' Oxcaml_flags.x86_peephole_remove_redundant_test
 
+  let cmm_strength_reduction = set' Oxcaml_flags.cmm_strength_reduction
+  let no_cmm_strength_reduction = clear' Oxcaml_flags.cmm_strength_reduction
   let cfg_stack_checks = set' Oxcaml_flags.cfg_stack_checks
   let no_cfg_stack_checks = clear' Oxcaml_flags.cfg_stack_checks
 
@@ -2484,6 +2500,7 @@ module Extra_params = struct
         set_int' Oxcaml_flags.vectorize_max_block_size
     | "cfg-peephole-optimize" -> set' Oxcaml_flags.cfg_peephole_optimize
     | "x86-peephole-optimize" -> set' Oxcaml_flags.x86_peephole_optimize
+    | "cmm-strength-reduction" -> set' Oxcaml_flags.cmm_strength_reduction
     | "cfg-stack-checks" -> set' Oxcaml_flags.cfg_stack_checks
     | "cfg-eliminate-dead-trap-handlers" ->
         set' Oxcaml_flags.cfg_eliminate_dead_trap_handlers
