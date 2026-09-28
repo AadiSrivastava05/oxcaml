@@ -1,0 +1,21 @@
+File "region_stack_space.ml", line 58, characters 24-51:
+58 |   | hd :: tl -> f hd :: map_local_param bound tl ~f
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Warning 222 [tmc-breaks-tailcall-region]: This call is in tail-modulo-cons
+  position in a TMC function, but it is enclosed in a local-allocation region
+  that cannot be closed as part of the call, so the call will not be
+  transformed into a tail call and the function does not run in constant
+  stack space.
+  This happens when a value allocated in the region may reach the callee,
+  which is the case as soon as the function takes a parameter at mode local.
+
+File "region_stack_space.ml", line 68, characters 25-49:
+68 |   | hd :: tl -> f' hd :: map_using_local tl ~f:f'
+                              ^^^^^^^^^^^^^^^^^^^^^^^^
+Warning 222 [tmc-breaks-tailcall-region]: This call is in tail-modulo-cons
+  position in a TMC function, but it is enclosed in a local-allocation region
+  that cannot be closed as part of the call, so the call will not be
+  transformed into a tail call and the function does not run in constant
+  stack space.
+  This happens when a value allocated in the region may reach the callee,
+  which is the case as soon as the function takes a parameter at mode local.
