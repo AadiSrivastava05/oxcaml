@@ -524,6 +524,8 @@ let compile_fundecl ~ppf_dump ~funcnames fd_cmm =
   let module Cfg_selection = Cfg_selectgen.Make (Cfg_selection) in
   Reg.clear_relocatable_regs ();
   fd_cmm
+  ++ Profile.record ~accumulate:true "cmm_strength_reduction"
+       Cmm_strength_reduction.fundecl
   ++ Profile.record ~accumulate:true "cmm_invariants" (cmm_invariants ppf_dump)
   ++ (fun (fd_cmm : Cmm.fundecl) ->
   Cfg_selection.emit_fundecl ~future_funcnames:funcnames fd_cmm

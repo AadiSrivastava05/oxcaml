@@ -37,6 +37,8 @@ let x86_peephole_remove_redundant_extension = ref true
 let x86_peephole_combine_add_rsp = ref true
 let x86_peephole_remove_redundant_test = ref true
 
+let cmm_strength_reduction = ref true   (* -[no-]cmm-strength-reduction *)
+
 let cfg_stack_checks = ref true         (* -[no-]cfg-stack-check *)
 let cfg_stack_checks_threshold = ref 16384 (* -cfg-stack-threshold *)
 
