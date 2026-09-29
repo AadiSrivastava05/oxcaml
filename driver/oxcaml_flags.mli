@@ -40,6 +40,8 @@ val x86_peephole_remove_redundant_test : bool ref
 
 val cmm_strength_reduction : bool ref
 
+val cmm_interior_pointers : bool ref
+
 val cfg_stack_checks : bool ref
 val cfg_stack_checks_threshold : int ref
 

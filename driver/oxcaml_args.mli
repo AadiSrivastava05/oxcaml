@@ -52,6 +52,8 @@ module type Oxcaml_options = sig
   val no_x86_peephole_remove_redundant_test : unit -> unit
   val cmm_strength_reduction : unit -> unit
   val no_cmm_strength_reduction : unit -> unit
+  val cmm_interior_pointers : unit -> unit
+  val no_cmm_interior_pointers : unit -> unit
   val cfg_stack_checks : unit -> unit
   val no_cfg_stack_checks : unit -> unit
   val cfg_stack_checks_threshold : int -> unit

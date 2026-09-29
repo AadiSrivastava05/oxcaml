@@ -157,6 +157,16 @@ let mk_cmm_strength_reduction f =
     Arg.Unit f,
     " Carry loop-invariant array indices in loop parameters" )
 
+let mk_cmm_interior_pointers f =
+  ( "-cmm-interior-pointers",
+    Arg.Unit f,
+    " Hoist array row addresses out of loops that cannot reach the GC" )
+
+let mk_no_cmm_interior_pointers f =
+  ( "-no-cmm-interior-pointers",
+    Arg.Unit f,
+    " Recompute array row addresses on every loop iteration" )
+
 let mk_no_cmm_strength_reduction f =
   ( "-no-cmm-strength-reduction",
     Arg.Unit f,
@@ -1349,6 +1359,8 @@ module type Oxcaml_options = sig
   val no_x86_peephole_remove_redundant_test : unit -> unit
   val cmm_strength_reduction : unit -> unit
   val no_cmm_strength_reduction : unit -> unit
+  val cmm_interior_pointers : unit -> unit
+  val no_cmm_interior_pointers : unit -> unit
   val cfg_stack_checks : unit -> unit
   val no_cfg_stack_checks : unit -> unit
   val cfg_stack_checks_threshold : int -> unit
@@ -1547,6 +1559,8 @@ module Make_oxcaml_options (F : Oxcaml_options) = struct
         F.no_x86_peephole_remove_redundant_test;
       mk_cmm_strength_reduction F.cmm_strength_reduction;
       mk_no_cmm_strength_reduction F.no_cmm_strength_reduction;
+      mk_cmm_interior_pointers F.cmm_interior_pointers;
+      mk_no_cmm_interior_pointers F.no_cmm_interior_pointers;
       mk_cfg_stack_checks F.cfg_stack_checks;
       mk_no_cfg_stack_checks F.no_cfg_stack_checks;
       mk_cfg_stack_checks_threshold F.cfg_stack_checks_threshold;
@@ -1900,6 +1914,8 @@ module Oxcaml_options_impl = struct
 
   let cmm_strength_reduction = set' Oxcaml_flags.cmm_strength_reduction
   let no_cmm_strength_reduction = clear' Oxcaml_flags.cmm_strength_reduction
+  let cmm_interior_pointers = set' Oxcaml_flags.cmm_interior_pointers
+  let no_cmm_interior_pointers = clear' Oxcaml_flags.cmm_interior_pointers
   let cfg_stack_checks = set' Oxcaml_flags.cfg_stack_checks
   let no_cfg_stack_checks = clear' Oxcaml_flags.cfg_stack_checks
 
@@ -2501,6 +2517,7 @@ module Extra_params = struct
     | "cfg-peephole-optimize" -> set' Oxcaml_flags.cfg_peephole_optimize
     | "x86-peephole-optimize" -> set' Oxcaml_flags.x86_peephole_optimize
     | "cmm-strength-reduction" -> set' Oxcaml_flags.cmm_strength_reduction
+    | "cmm-interior-pointers" -> set' Oxcaml_flags.cmm_interior_pointers
     | "cfg-stack-checks" -> set' Oxcaml_flags.cfg_stack_checks
     | "cfg-eliminate-dead-trap-handlers" ->
         set' Oxcaml_flags.cfg_eliminate_dead_trap_handlers

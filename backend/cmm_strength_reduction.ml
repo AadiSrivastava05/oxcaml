@@ -449,18 +449,381 @@ let reduce ~duplicated ~int_vars ~label ~expr =
   in
   Ccatch (flag, handlers, add_exit_args ~label ~extra body)
 
+(* {1 Interior pointers}
+
+   A loop that contains no safepoint may hold pointers into the middle of a heap
+   block: no collection can happen while they are live, so the collector never
+   has to make sense of them. [Addr] is exactly that kind of value -- a derived
+   pointer, ignored by the GC, and a fatal error ("bad GC root") if it is ever
+   live at a frame descriptor. So in such a loop the address of an array row can
+   be formed once, ahead of the loop, instead of being rebuilt from a row index
+   on every iteration.
+
+   An access [a.(b + i)] reaches [Cmm] as
+
+   {v (+a (+a a (<< (+ b i) 2)) -8) v}
+
+   with [i] an affine function [m * c + k] of the handler parameter [c] that is
+   the loop counter. [Caddi], [Cadda] and [Clsl] are wrapping native operations
+   and shifting distributes over wrapping addition, so that address is equal, on
+   every input and overflow included, to
+
+   {v (+a (+a (+a a (<< b 2)) (<< c 3)) -4) v}
+
+   whose leading summand is loop-invariant. Hoisting it leaves one addressing
+   mode [disp(base, counter, scale)] per row, so four rows share one index
+   register and one increment where they used to carry four running indices. The
+   counter is used naked, so the retagging of a [for] counter leaves the loop as
+   well.
+
+   Only the address operand of a [Cload] or a [Cstore] is rewritten, so the
+   derived pointer is consumed by the addressing mode that needs it and by
+   nothing else. *)
+
+(* Operations at which a frame descriptor may be emitted or the GC may run.
+   Written as a complete match, so that a new [Cmm] operation is a compile error
+   here rather than a silently permitted safepoint.
+
+   [Craise] is not one of them: the amd64 emitter records the frame of a raise
+   with an empty live set, and [Raise_notrace] records no frame at all, so the
+   bound-check raises of a checked array access cannot turn a derived pointer
+   into a GC root. [Cdivi] and [Cmodi] are rejected because their
+   division-by-zero path is a call. *)
+let operation_is_safepoint (op : operation) =
+  match op with
+  | Capply _ | Cextcall _ | Calloc _ | Cpoll | Cprobe _ | Cbeginregion
+  | Cendregion | Catomic _ | Cdivi _ | Cmodi _ ->
+    true
+  | Cload _ | Cstore _ | Caddi | Csubi | Cmuli | Cmulhi _ | Caddi128 | Csubi128
+  | Cmuli64 _ | Cand | Cor | Cxor | Clsl | Clsr | Casr | Cbswap _ | Ccsel _
+  | Cclz | Cctz | Cpopcnt | Cprefetch _ | Ccmpi _ | Caddv | Cadda | Cnegf _
+  | Cabsf _ | Caddf _ | Csubf _ | Cmulf _ | Cdivf _ | Cpackf32
+  | Creinterpret_cast _ | Cstatic_cast _ | Ccmpf _ | Craise _
+  | Cprobe_is_enabled _ | Copaque | Ctuple_field _ | Cdls_get | Ctls_get
+  | Cdomain_index | Cpause ->
+    false
+
+(* Does no collection happen anywhere inside [expr]? A nested loop is covered by
+   the same walk: a back edge only carries a poll when polling is enabled, and
+   the caller has already established that it is not. *)
+let rec is_gc_free expr =
+  match expr with
+  | Cop (op, _, _) when operation_is_safepoint op -> false
+  | _ ->
+    let safe = ref true in
+    iter_subexpressions (fun sub -> if !safe then safe := is_gc_free sub) expr;
+    !safe
+
+(* {2 Address expressions}
+
+   [{ root; scale; index; disp }] denotes [root + scale * index + disp]. At most
+   one scaled term is accepted; anything else declines. *)
+
+type address =
+  { root : V.t;
+    scale : int;
+    index : expression option;
+    disp : int
+  }
+
+let set_index address scale index =
+  match address.index with
+  | Some _ -> None
+  | None -> Some { address with scale; index = Some index }
+
+let rec address_of (expr : expression) =
+  match expr with
+  | Cvar root -> Some { root; scale = 1; index = None; disp = 0 }
+  | Cop (Cadda, [lhs; rhs], _) -> (
+    match address_of lhs with
+    | None -> None
+    | Some address -> (
+      match rhs with
+      | Cconst_int (n, _) when in_range n ->
+        Some { address with disp = address.disp + n }
+      | Cop (Clsl, [inner; Cconst_int (shift, _)], _)
+        when shift >= 0 && shift <= 3 ->
+        set_index address (1 lsl shift) inner
+      | Cop (Cmuli, args, _) -> (
+        match split_constant args with
+        | Some (inner, n) when n = 1 || n = 2 || n = 4 || n = 8 ->
+          set_index address n inner
+        | Some _ | None -> set_index address 1 rhs)
+      | _ -> set_index address 1 rhs))
+  | _ -> None
+
+(* {2 Index expressions}
+
+   [{ invariant; coefficient; multiplier; offset }] denotes
+
+   {v coefficient * invariant + multiplier * counter + offset v}
+
+   Only one invariant term is carried: it is what becomes the hoisted pointer,
+   and two of them would need two pointers. *)
+
+type index =
+  { invariant : V.t option;
+    coefficient : int;
+    multiplier : int;
+    offset : int
+  }
+
+let zero_index =
+  { invariant = None; coefficient = 0; multiplier = 0; offset = 0 }
+
+let normalise_index index =
+  if
+    in_range index.coefficient && in_range index.multiplier
+    && in_range index.offset
+  then Some index
+  else None
+
+let add_index left right =
+  match left.invariant, right.invariant with
+  | Some _, Some _ -> None
+  | None, invariant | invariant, None ->
+    normalise_index
+      { invariant;
+        coefficient = left.coefficient + right.coefficient;
+        multiplier = left.multiplier + right.multiplier;
+        offset = left.offset + right.offset
+      }
+
+let scale_index n index =
+  normalise_index
+    { index with
+      coefficient = index.coefficient * n;
+      multiplier = index.multiplier * n;
+      offset = index.offset * n
+    }
+
+(* [Clet]-bound definitions are followed, because a checked array access binds
+   the index expression to a variable and shares it with the bound check. Fuel
+   bounds the work; [Cmm] bindings are acyclic, so it is not needed for
+   termination. *)
+let rec index_of ~affines ~defs ~invariant ~fuel (expr : expression) =
+  if fuel <= 0
+  then None
+  else
+    let recurse = index_of ~affines ~defs ~invariant ~fuel:(fuel - 1) in
+    match expr with
+    | Cconst_int (n, _) when in_range n -> Some { zero_index with offset = n }
+    | Cvar v -> (
+      match V.Map.find_opt v affines with
+      | Some (affine : affine) ->
+        normalise_index
+          { zero_index with
+            multiplier = affine.multiplier;
+            offset = affine.offset
+          }
+      | None -> (
+        if invariant v
+        then Some { zero_index with invariant = Some v; coefficient = 1 }
+        else
+          match V.Map.find_opt v defs with
+          | Some def -> recurse def
+          | None -> None))
+    | Cop (Caddi, [lhs; rhs], _) -> (
+      match recurse lhs, recurse rhs with
+      | Some lhs, Some rhs -> add_index lhs rhs
+      | (None | Some _), _ -> None)
+    | Cop (Csubi, [lhs; Cconst_int (n, _)], _) when in_range n -> (
+      match recurse lhs with
+      | Some lhs -> add_index lhs { zero_index with offset = -n }
+      | None -> None)
+    | Cop (Clsl, [inner; Cconst_int (shift, _)], _)
+      when shift >= 0 && shift <= 20 -> (
+      match recurse inner with
+      | Some index -> scale_index (1 lsl shift) index
+      | None -> None)
+    | Cop (Cmuli, args, _) -> (
+      match split_constant args with
+      | None -> None
+      | Some (inner, n) -> (
+        match recurse inner with
+        | Some index -> scale_index n index
+        | None -> None))
+    | _ -> None
+
+(* The [Clet] bindings of [body], excluding variables bound more than once in
+   the function. *)
+let defs_of_body ~duplicated body =
+  let defs = ref V.Map.empty in
+  let rec loop expr =
+    (match expr with
+    | Clet (v, def, _) when not (V.Set.mem (VP.var v) duplicated) ->
+      defs := V.Map.add (VP.var v) def !defs
+    | _ -> ());
+    iter_subexpressions loop expr
+  in
+  loop body;
+  !defs
+
+(* {2 The rewrite} *)
+
+let rec log2 n acc =
+  if n = 1
+  then Some acc
+  else if n <= 0 || n land 1 = 1
+  then None
+  else log2 (n lsr 1) (acc + 1)
+
+let scale_by n expr dbg =
+  if n = 1
+  then expr
+  else
+    match log2 n 0 with
+    | Some shift -> Cop (Clsl, [expr; Cconst_int (shift, dbg)], dbg)
+    | None -> Cop (Cmuli, [expr; Cconst_int (n, dbg)], dbg)
+
+(* The scales an x86 addressing mode can apply to its index register. A wider
+   step would need a shift inside the loop, which is what this pass is trying to
+   remove. *)
+let is_addressing_scale n = n = 0 || n = 1 || n = 2 || n = 4 || n = 8
+
+let same_base (root, invariant, bytes) (root', invariant', bytes') =
+  V.same root root' && V.same invariant invariant' && bytes = bytes'
+
+(* Rewrite the load and store addresses of [body] against [counter]. Returns the
+   bindings to hoist and the new body. *)
+let hoist_bases ~affines ~defs ~invariant ~counter ~dbg body =
+  let bases = ref [] in
+  let base_var key =
+    match List.find_opt (fun (key', _) -> same_base key key') !bases with
+    | Some (_, var) -> var
+    | None ->
+      let var = V.create_local "ip_base" in
+      bases := (key, var) :: !bases;
+      var
+  in
+  let rewrite_address dbg expr =
+    match address_of expr with
+    | None -> expr
+    | Some { root; scale; index; disp } -> (
+      if not (invariant root)
+      then expr
+      else
+        let index =
+          match index with
+          | None -> Some zero_index
+          | Some index -> index_of ~affines ~defs ~invariant ~fuel:24 index
+        in
+        match index with
+        | None -> expr
+        | Some { invariant = inv; coefficient; multiplier; offset } ->
+          let bytes = scale * coefficient in
+          let step = scale * multiplier in
+          let displacement = (scale * offset) + disp in
+          if
+            (not (in_range bytes))
+            || (not (in_range step))
+            || (not (in_range displacement))
+            || not (is_addressing_scale step)
+          then expr
+          else
+            let base =
+              match inv with
+              | Some inv when bytes <> 0 -> Cvar (base_var (root, inv, bytes))
+              | Some _ | None -> Cvar root
+            in
+            let base =
+              if step = 0
+              then base
+              else Cop (Cadda, [base; scale_by step (Cvar counter) dbg], dbg)
+            in
+            if displacement = 0
+            then base
+            else Cop (Cadda, [base; Cconst_int (displacement, dbg)], dbg))
+  in
+  let rec loop expr =
+    match expr with
+    | Cop ((Cload _ as op), [address], dbg) ->
+      Cop (op, [rewrite_address dbg (loop address)], dbg)
+    | Cop ((Cstore _ as op), [address; value], dbg) ->
+      Cop (op, [rewrite_address dbg (loop address); loop value], dbg)
+    | _ -> map_subexpressions loop expr
+  in
+  let body = loop body in
+  let bindings =
+    List.map
+      (fun ((root, inv, bytes), var) ->
+        var, Cop (Cadda, [Cvar root; scale_by bytes (Cvar inv) dbg], dbg))
+      !bases
+  in
+  bindings, body
+
+(* Form interior pointers for the handler named [label] of the [Ccatch
+   Recursive] node [expr]. Returns the bindings to wrap around the node, and the
+   node. Raises [Not_applicable] if nothing can or should be done, in which case
+   the caller keeps the original node. *)
+let interior_pointers ~duplicated ~label ~expr =
+  let flag, handlers, body =
+    match expr with
+    | Ccatch (flag, handlers, body) -> flag, handlers, body
+    | _ -> raise Not_applicable
+  in
+  let handler =
+    match List.find_opt (is_label label) handlers with
+    | Some handler -> handler
+    | None -> raise Not_applicable
+  in
+  (* The derived pointers live across the whole node, so the whole node has to
+     be free of safepoints, not just the handler being rewritten. *)
+  if not (is_gc_free expr) then raise Not_applicable;
+  let bound_inside = bound_variables V.Set.empty expr in
+  let invariant v = not (V.Set.mem v bound_inside) in
+  let defs = defs_of_body ~duplicated handler.body in
+  let dbg = handler.dbg in
+  let rec try_counter params =
+    match params with
+    | [] -> raise Not_applicable
+    | (param, machtype) :: params ->
+      let counter = VP.var param in
+      let affines =
+        if is_int_machtype machtype
+        then affines_of_body ~duplicated ~counter handler.body
+        else V.Map.empty
+      in
+      if V.Map.is_empty affines
+      then try_counter params
+      else
+        let bindings, rewritten =
+          hoist_bases ~affines ~defs ~invariant ~counter ~dbg handler.body
+        in
+        (* Nothing was hoisted: the rewrite would at best shuffle a constant
+           between two equivalent addressing modes, so leave the loop to the
+           strength reduction instead. *)
+        if List.compare_length_with bindings 0 = 0
+        then try_counter params
+        else bindings, rewritten
+  in
+  let bindings, rewritten = try_counter handler.params in
+  let handlers =
+    List.map
+      (fun (handler : static_handler) ->
+        if is_label label handler
+        then { handler with body = rewritten }
+        else handler)
+      handlers
+  in
+  bindings, Ccatch (flag, handlers, body)
+
 (* {1 Driver} *)
 
-let rec rewrite ~duplicated int_vars expr =
+let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers int_vars
+    expr =
+  let rewrite =
+    rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+  in
   match expr with
   | Clet (v, def, body) ->
-    let def = rewrite ~duplicated int_vars def in
+    let def = rewrite int_vars def in
     let int_vars =
       if is_int_expression int_vars def
       then add_int_var ~duplicated int_vars (VP.var v)
       else int_vars
     in
-    Clet (v, def, rewrite ~duplicated int_vars body)
+    Clet (v, def, rewrite int_vars body)
   | Ccatch (flag, handlers, body) -> (
     (* Bottom-up, so that an inner loop is already in its final form when the
        loop enclosing it is examined. *)
@@ -468,26 +831,74 @@ let rec rewrite ~duplicated int_vars expr =
       List.map
         (fun (handler : static_handler) ->
           let int_vars = add_int_params ~duplicated int_vars handler.params in
-          { handler with body = rewrite ~duplicated int_vars handler.body })
+          { handler with body = rewrite int_vars handler.body })
         handlers
     in
-    let expr = Ccatch (flag, handlers, rewrite ~duplicated int_vars body) in
+    let expr = Ccatch (flag, handlers, rewrite int_vars body) in
     match flag with
     | Normal | Exn_handler -> expr
     | Recursive ->
+      (* Interior pointers first. Where they fire they subsume the strength
+         reduction: a fixed base plus the loop counter is strictly better than a
+         running index, and the sum [b + i] the strength reduction looks for is
+         gone from the addresses it rewrote, so the two cannot both fire on one
+         access and leave the loop carrying both. *)
+      let bindings, expr =
+        if not form_interior_pointers
+        then [], expr
+        else
+          List.fold_left
+            (fun (bindings, expr) (handler : static_handler) ->
+              match
+                interior_pointers ~duplicated ~label:handler.label ~expr
+              with
+              | new_bindings, expr -> new_bindings @ bindings, expr
+              | exception Not_applicable -> bindings, expr)
+            ([], expr) handlers
+      in
+      let expr =
+        if not strength_reduction
+        then expr
+        else
+          List.fold_left
+            (fun expr (handler : static_handler) ->
+              match reduce ~duplicated ~int_vars ~label:handler.label ~expr with
+              | expr -> expr
+              | exception Not_applicable -> expr)
+            expr handlers
+      in
       List.fold_left
-        (fun expr (handler : static_handler) ->
-          match reduce ~duplicated ~int_vars ~label:handler.label ~expr with
-          | expr -> expr
-          | exception Not_applicable -> expr)
-        expr handlers)
-  | _ -> map_subexpressions (rewrite ~duplicated int_vars) expr
+        (fun expr (var, def) -> Clet (VP.create var, def, expr))
+        expr bindings)
+  | _ -> map_subexpressions (rewrite int_vars) expr
+
+(* Interior pointers are only correct where no collection can happen, and a loop
+   only escapes the back-edge poll of [Cfg_polling] when polling is disabled for
+   the whole unit or the function is annotated [@poll error], in which case any
+   remaining polling point is a compile error. Deciding it here rather than
+   trusting the backend keeps the failure mode "the pass declines" instead of
+   the backend's "bad GC root", which names no loop and no source location. *)
+let polls_are_impossible (fundecl : fundecl) =
+  (not Config.poll_insertion)
+  || !Oxcaml_flags.disable_poll_insertion
+  ||
+  match fundecl.fun_poll with
+  | Lambda.Error_poll -> true
+  | Lambda.Default_poll -> false
 
 let fundecl (fundecl : fundecl) =
-  if not !Oxcaml_flags.cmm_strength_reduction
+  let strength_reduction = !Oxcaml_flags.cmm_strength_reduction in
+  let form_interior_pointers =
+    !Oxcaml_flags.cmm_interior_pointers && polls_are_impossible fundecl
+  in
+  if not (strength_reduction || form_interior_pointers)
   then fundecl
   else
     let params = List.map (fun (param, _) -> VP.var param) fundecl.fun_args in
     let duplicated = duplicate_binders ~params fundecl.fun_body in
     let int_vars = add_int_params ~duplicated V.Set.empty fundecl.fun_args in
-    { fundecl with fun_body = rewrite ~duplicated int_vars fundecl.fun_body }
+    { fundecl with
+      fun_body =
+        rewrite ~duplicated ~strength_reduction ~form_interior_pointers int_vars
+          fundecl.fun_body
+    }
