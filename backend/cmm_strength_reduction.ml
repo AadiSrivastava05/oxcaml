@@ -808,12 +808,413 @@ let interior_pointers ~duplicated ~label ~expr =
   in
   bindings, Ccatch (flag, handlers, body)
 
+(* {1 Induction variables with a loop-invariant stride}
+
+   [reduce] carries [invariant + m * counter + c] for an integer constant [m]. A
+   loop over the rows of a matrix needs more than that: the base of row [r] is
+   [r * columns], which steps by the loop-invariant [columns] rather than by a
+   constant, so [reduce] cannot express it and the multiplication is rebuilt on
+   every row. The same shape sits one level above every interior pointer
+   [hoist_bases] forms, since the pointer to a row is the array plus a multiple
+   of [columns]: the inner loop walks a row by an addressing mode, and then the
+   outer loop recomputes all of the row pointers from scratch.
+
+   This carries any [Clet]-bound value of the form [start + stride * counter]
+   whose [stride] and [start] are built only from constants and from variables
+   bound outside the whole [Ccatch]. Such a value then steps by a single
+   addition of a quantity computed once before the loop. Constant strides are
+   deliberately left to [reduce], which also knows when carrying one pays for
+   the register it costs.
+
+   Two things restrict it to loops that cannot reach a collection. A value
+   derived from a pointer is a pointer the collector cannot update, exactly as
+   for the interior pointers above. And hoisting the stride out of the loop
+   reads its operands once instead of once per iteration, which is the same
+   computation only if nothing can move them in between. *)
+
+type coeff =
+  | Const of int
+  | Term of expression
+
+let coeff_expr ~dbg = function
+  | Const n -> Cconst_int (n, dbg)
+  | Term expr -> expr
+
+(* Constants are kept small for the same reason as in [affine], so that nothing
+   computed from them can overflow silently; a larger one is carried as an
+   expression and left to the backend. *)
+let coeff_of_int ~dbg n =
+  if in_range n then Const n else Term (Cconst_int (n, dbg))
+
+let add_coeff ~dbg a b =
+  match a, b with
+  | Const 0, c | c, Const 0 -> c
+  | Const m, Const n -> coeff_of_int ~dbg (m + n)
+  | (Const _ | Term _), (Const _ | Term _) ->
+    Term (Cop (Caddi, [coeff_expr ~dbg a; coeff_expr ~dbg b], dbg))
+
+let sub_coeff ~dbg a b =
+  match a, b with
+  | c, Const 0 -> c
+  | Const m, Const n -> coeff_of_int ~dbg (m - n)
+  | (Const _ | Term _), (Const _ | Term _) ->
+    Term (Cop (Csubi, [coeff_expr ~dbg a; coeff_expr ~dbg b], dbg))
+
+let mul_coeff ~dbg a b =
+  match a, b with
+  | Const 0, _ | _, Const 0 -> Const 0
+  | Const 1, c | c, Const 1 -> c
+  | Const m, Const n -> coeff_of_int ~dbg (m * n)
+  | (Const _ | Term _), (Const _ | Term _) ->
+    Term (Cop (Cmuli, [coeff_expr ~dbg a; coeff_expr ~dbg b], dbg))
+
+let shift_coeff ~dbg c n =
+  match c with
+  | Const 0 -> Const 0
+  | Const m when in_range (m lsl n) -> Const (m lsl n)
+  | Const _ | Term _ ->
+    Term (Cop (Clsl, [coeff_expr ~dbg c; Cconst_int (n, dbg)], dbg))
+
+(* [n * c], preferring the shift the backend would have to find anyway. *)
+let scale_coeff ~dbg n c =
+  if n >= 1
+  then Term (scale_by n (coeff_expr ~dbg c) dbg)
+  else mul_coeff ~dbg c (Const n)
+
+(* An expression that cannot change within the loop and can be evaluated before
+   it: pure, total, and reading only variables bound outside the whole node.
+   [relaxed] drops the requirement that those variables hold integers, which is
+   sound only when nothing can move a pointer while the loop runs. *)
+let rec invariant_int ~invariant ~int_vars ~relaxed expr =
+  match expr with
+  | Cconst_int _ | Cconst_natint _ -> true
+  | Cvar v -> invariant v && (relaxed || V.Set.mem v int_vars)
+  | Cop
+      ((Caddi | Csubi | Cmuli | Cand | Cor | Cxor | Clsl | Clsr | Casr), args, _)
+    ->
+    List.for_all (invariant_int ~invariant ~int_vars ~relaxed) args
+  | _ -> false
+
+(* [{ stride; offset; pointer }] denotes [pointer + (stride * counter +
+   offset)], with [pointer] absent for an integer. *)
+type linear =
+  { stride : coeff;
+    offset : coeff;
+    pointer : expression option
+  }
+
+let is_scalar linear =
+  match linear.pointer with None -> true | Some _ -> false
+
+let rec linear_of ~dbg ~counter ~invariant ~int_vars ~relaxed ~forms expr =
+  let recurse = linear_of ~dbg ~counter ~invariant ~int_vars ~relaxed ~forms in
+  let scalar stride offset = Some { stride; offset; pointer = None } in
+  match expr with
+  | Cvar v when V.same v counter -> scalar (Const 1) (Const 0)
+  | Cvar v when V.Map.mem v forms -> V.Map.find_opt v forms
+  | _ when invariant_int ~invariant ~int_vars ~relaxed expr ->
+    scalar (Const 0) (Term expr)
+  | Cop (Caddi, [a; b], _) -> (
+    match recurse a, recurse b with
+    | Some a, Some b when is_scalar a && is_scalar b ->
+      scalar
+        (add_coeff ~dbg a.stride b.stride)
+        (add_coeff ~dbg a.offset b.offset)
+    | (Some _ | None), (Some _ | None) -> None)
+  | Cop (Csubi, [a; b], _) -> (
+    match recurse a, recurse b with
+    | Some a, Some b when is_scalar a && is_scalar b ->
+      scalar
+        (sub_coeff ~dbg a.stride b.stride)
+        (sub_coeff ~dbg a.offset b.offset)
+    | (Some _ | None), (Some _ | None) -> None)
+  | Cop (Cmuli, [a; b], _) -> (
+    (* Linear only when one side does not involve the counter. *)
+    match recurse a, recurse b with
+    | Some a, Some b when is_scalar a && is_scalar b -> (
+      match a.stride, b.stride with
+      | Const 0, _ ->
+        scalar
+          (mul_coeff ~dbg a.offset b.stride)
+          (mul_coeff ~dbg a.offset b.offset)
+      | _, Const 0 ->
+        scalar
+          (mul_coeff ~dbg b.offset a.stride)
+          (mul_coeff ~dbg b.offset a.offset)
+      | (Const _ | Term _), (Const _ | Term _) -> None)
+    | (Some _ | None), (Some _ | None) -> None)
+  | Cop (Clsl, [a; Cconst_int (n, _)], _) when n >= 0 && n <= 20 -> (
+    match recurse a with
+    | Some a when is_scalar a ->
+      scalar (shift_coeff ~dbg a.stride n) (shift_coeff ~dbg a.offset n)
+    | Some _ | None -> None)
+  | Cop (Cadda, [a; b], _) -> (
+    (* The root of an interior pointer is a variable bound outside the loop; it
+       is matched here rather than by [recurse] so that it cannot be mistaken
+       for an integer under [relaxed]. *)
+    let rooted =
+      match a with
+      | Cvar p when invariant p -> (
+        match recurse b with
+        | Some b when is_scalar b -> Some { b with pointer = Some (Cvar p) }
+        | Some _ | None -> None)
+      | _ -> None
+    in
+    match rooted with
+    | Some _ -> rooted
+    | None -> (
+      match recurse a, recurse b with
+      | Some a, Some b when (not (is_scalar a)) && is_scalar b ->
+        Some
+          { stride = add_coeff ~dbg a.stride b.stride;
+            offset = add_coeff ~dbg a.offset b.offset;
+            pointer = a.pointer
+          }
+      | (Some _ | None), (Some _ | None) -> None))
+  | _ -> None
+
+let same_int_op (a : operation) (b : operation) =
+  match a, b with
+  | Caddi, Caddi
+  | Csubi, Csubi
+  | Cmuli, Cmuli
+  | Cand, Cand
+  | Cor, Cor
+  | Cxor, Cxor
+  | Clsl, Clsl
+  | Clsr, Clsr
+  | Casr, Casr
+  | Cadda, Cadda ->
+    true
+  | _ -> false
+
+(* Structural equality over the expressions built above: constants, variables
+   and the pure integer operations. The row pointers of one loop all advance by
+   the same number of bytes, and computing that once is one register rather than
+   one per pointer. *)
+let rec same_expression a b =
+  match a, b with
+  | Cconst_int (m, _), Cconst_int (n, _) -> Int.equal m n
+  | Cvar u, Cvar v -> V.same u v
+  | Cop (op, args, _), Cop (op', args', _) ->
+    same_int_op op op'
+    && List.compare_lengths args args' = 0
+    && List.for_all2 same_expression args args'
+  | _ -> false
+
+(* The linear form of every [Clet]-bound variable of [body] that has one,
+   following chains of such bindings as [affines_of_body] does. *)
+let forms_of_body ~dbg ~duplicated ~counter ~invariant ~int_vars ~relaxed body =
+  let forms = ref V.Map.empty in
+  let rec loop expr =
+    (match expr with
+    | Clet (v, def, _) when not (V.Set.mem (VP.var v) duplicated) -> (
+      match
+        linear_of ~dbg ~counter ~invariant ~int_vars ~relaxed ~forms:!forms def
+      with
+      | Some linear -> forms := V.Map.add (VP.var v) linear !forms
+      | None -> ())
+    | _ -> ());
+    iter_subexpressions loop expr
+  in
+  loop body;
+  !forms
+
+(* Replace the defining expression of each carried variable by the parameter
+   that now holds it. The binding itself stays, so nothing has to be substituted
+   and the copy folds away in register allocation; whatever the definition used
+   to read becomes unused, and the backend drops it. *)
+let replace_defs ~carried expr =
+  let rec loop expr =
+    match expr with
+    | Clet (v, def, body) -> (
+      match V.Map.find_opt (VP.var v) carried with
+      | Some var -> Clet (v, Cvar var, loop body)
+      | None -> Clet (v, loop def, loop body))
+    | _ -> map_subexpressions loop expr
+  in
+  loop expr
+
+(* At most this many values are carried out of one loop, so that the parameters
+   added cannot by themselves exhaust the register file. *)
+let max_carried = 6
+
+(* Carry the invariant-strided induction variables of the handler named [label]
+   of the [Ccatch Recursive] node [expr]. Returns the bindings to wrap around
+   the node, and the node. Raises [Not_applicable] if nothing can or should be
+   done, in which case the caller keeps the original node. *)
+let reduce_invariant_strides ~duplicated ~int_vars ~relaxed ~carry_pointers
+    ~label ~expr =
+  let flag, handlers, body =
+    match expr with
+    | Ccatch (flag, handlers, body) -> flag, handlers, body
+    | _ -> raise Not_applicable
+  in
+  let handler =
+    match List.find_opt (is_label label) handlers with
+    | Some handler -> handler
+    | None -> raise Not_applicable
+  in
+  let roots =
+    body :: List.map (fun (handler : static_handler) -> handler.body) handlers
+  in
+  let exits = collect_exit_args ~label ~roots in
+  (match exits with [] -> raise Not_applicable | _ :: _ -> ());
+  let arity = List.length handler.params in
+  List.iter
+    (fun args ->
+      if List.compare_length_with args arity <> 0 then raise Not_applicable)
+    exits;
+  let dbg = handler.dbg in
+  let bound_inside = bound_variables V.Set.empty expr in
+  let invariant v = not (V.Set.mem v bound_inside) in
+  let rec find_counter index params =
+    match params with
+    | [] -> raise Not_applicable
+    | (param, machtype) :: params ->
+      let counter = VP.var param in
+      let affines =
+        if is_int_machtype machtype
+        then affines_of_body ~duplicated ~counter handler.body
+        else V.Map.empty
+      in
+      let classified =
+        if V.Map.is_empty affines
+        then []
+        else
+          List.map
+            (fun args -> classify_exit_arg ~affines (nth_arg args index))
+            exits
+      in
+      let eligible =
+        List.exists
+          (function Some (Step _) -> true | Some (Fresh _) | None -> false)
+          classified
+        && List.for_all Option.is_some classified
+      in
+      if eligible
+      then index, counter, affines, classified
+      else find_counter (index + 1) params
+  in
+  let index, counter, affines, _classified = find_counter 0 handler.params in
+  let forms =
+    forms_of_body ~dbg ~duplicated ~counter ~invariant ~int_vars ~relaxed
+      handler.body
+  in
+  let defs = defs_of_body ~duplicated handler.body in
+  (* A constant stride is [reduce]'s business, and carrying a value derived from
+     a pointer is sound only where no collection can happen. *)
+  let worth_carrying _ linear =
+    match linear.stride with
+    | Const _ -> false
+    | Term _ -> (
+      match linear.pointer with None -> true | Some _ -> carry_pointers)
+  in
+  let candidates =
+    V.Map.filter
+      (fun v linear -> V.Map.mem v defs && worth_carrying v linear)
+      forms
+  in
+  (* Carrying a value makes whatever it was computed from dead, and the row
+     index a row pointer is built from is exactly such a value. Drop every
+     candidate that nothing reads once the others are carried, rather than
+     spending a register on a value the backend is about to delete. *)
+  let rec prune candidates =
+    let probe = V.Map.mapi (fun _ _ -> V.create_local "ivs_probe") candidates in
+    let rewritten = replace_defs ~carried:probe handler.body in
+    let kept = V.Map.filter (fun v _ -> occurs v rewritten) candidates in
+    if V.Map.cardinal kept = V.Map.cardinal candidates then kept else prune kept
+  in
+  let candidates = prune candidates in
+  if V.Map.is_empty candidates then raise Not_applicable;
+  if V.Map.cardinal candidates > max_carried then raise Not_applicable;
+  let ordered = V.Map.bindings candidates in
+  let carried = List.map (fun (v, _) -> v, V.create_local "ivs") ordered in
+  let lookup table v =
+    match List.find_opt (fun (v', _) -> V.same v v') table with
+    | Some (_, var) -> var
+    | None -> raise Not_applicable
+  in
+  let handler_body =
+    replace_defs
+      ~carried:
+        (List.fold_left
+           (fun map (v, _) -> V.Map.add v (lookup carried v) map)
+           V.Map.empty ordered)
+      handler.body
+  in
+  (* The step is the only thing that has to survive into the loop, so it is the
+     only thing bound before it; a fresh start is built where it is used, which
+     is an edge that runs once. *)
+  let steps = ref [] in
+  let step_var def =
+    match List.find_opt (fun (def', _) -> same_expression def def') !steps with
+    | Some (_, var) -> var
+    | None ->
+      let var = V.create_local "ivs_step" in
+      steps := (def, var) :: !steps;
+      var
+  in
+  let extra args =
+    let classified = classify_exit_arg ~affines (nth_arg args index) in
+    List.map
+      (fun (v, linear) ->
+        let var = lookup carried v in
+        match classified with
+        | Some (Step n) ->
+          let add =
+            match linear.pointer with None -> Caddi | Some _ -> Cadda
+          in
+          let step =
+            step_var (coeff_expr ~dbg (scale_coeff ~dbg n linear.stride))
+          in
+          Cop (add, [Cvar var; Cvar step], dbg)
+        | Some (Fresh start) -> (
+          let scaled =
+            match start with
+            | Cconst_int (0, _) -> Const 0
+            | Cconst_int (1, _) -> linear.stride
+            | _ -> mul_coeff ~dbg linear.stride (Term start)
+          in
+          let value = coeff_expr ~dbg (add_coeff ~dbg scaled linear.offset) in
+          match linear.pointer with
+          | None -> value
+          | Some pointer -> Cop (Cadda, [pointer; value], dbg))
+        | None -> raise Not_applicable)
+      ordered
+  in
+  let extra_params =
+    List.map
+      (fun (v, linear) ->
+        ( VP.create (lookup carried v),
+          match linear.pointer with None -> typ_int | Some _ -> typ_addr ))
+      ordered
+  in
+  let handlers =
+    List.map
+      (fun (handler : static_handler) ->
+        let handler =
+          if is_label label handler
+          then
+            { handler with
+              params = handler.params @ extra_params;
+              body = handler_body
+            }
+          else handler
+        in
+        { handler with body = add_exit_args ~label ~extra handler.body })
+      handlers
+  in
+  let expr = Ccatch (flag, handlers, add_exit_args ~label ~extra body) in
+  List.map (fun (def, var) -> var, def) !steps, expr
+
 (* {1 Driver} *)
 
-let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers int_vars
-    expr =
+let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+    ~invariant_strides ~carry_pointers int_vars expr =
   let rewrite =
     rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+      ~invariant_strides ~carry_pointers
   in
   match expr with
   | Clet (v, def, body) ->
@@ -867,6 +1268,25 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers int_vars
               | exception Not_applicable -> expr)
             expr handlers
       in
+      (* The row loop above an interior pointer steps it by a multiple of the
+         row length, which is a loop-invariant value rather than a constant, so
+         [reduce] cannot carry it and every row rebuilds the pointer from the
+         row index. *)
+      let relaxed = form_interior_pointers && is_gc_free expr in
+      let bindings, expr =
+        if not (strength_reduction && invariant_strides && relaxed)
+        then bindings, expr
+        else
+          List.fold_left
+            (fun (bindings, expr) (handler : static_handler) ->
+              match
+                reduce_invariant_strides ~duplicated ~int_vars ~relaxed
+                  ~carry_pointers ~label:handler.label ~expr
+              with
+              | new_bindings, expr -> new_bindings @ bindings, expr
+              | exception Not_applicable -> bindings, expr)
+            (bindings, expr) handlers
+      in
       List.fold_left
         (fun expr (var, def) -> Clet (VP.create var, def, expr))
         expr bindings)
@@ -891,6 +1311,15 @@ let fundecl (fundecl : fundecl) =
   let form_interior_pointers =
     !Oxcaml_flags.cmm_interior_pointers && polls_are_impossible fundecl
   in
+  let invariant_strides = !Oxcaml_flags.cmm_invariant_strides in
+  (* A carried pointer is live across the loop's back edge, which is where a
+     poll would go, so it is only representable where the whole unit is compiled
+     without polling; [Cfg_selectgen] admits an [Addr] in a [Ccatch] register
+     under exactly this condition. *)
+  let carry_pointers =
+    !Oxcaml_flags.cmm_carried_pointers
+    && ((not Config.poll_insertion) || !Oxcaml_flags.disable_poll_insertion)
+  in
   if not (strength_reduction || form_interior_pointers)
   then fundecl
   else
@@ -899,6 +1328,6 @@ let fundecl (fundecl : fundecl) =
     let int_vars = add_int_params ~duplicated V.Set.empty fundecl.fun_args in
     { fundecl with
       fun_body =
-        rewrite ~duplicated ~strength_reduction ~form_interior_pointers int_vars
-          fundecl.fun_body
+        rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+          ~invariant_strides ~carry_pointers int_vars fundecl.fun_body
     }

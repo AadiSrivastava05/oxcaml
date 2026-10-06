@@ -1382,14 +1382,24 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
         (* Intermediate registers to handle cases where some registers from src
            are present in dest *)
         let tmp_regs = Reg.createv_with_typs src in
-        (* Ccatch registers must not contain out of heap pointers *)
+        (* Ccatch registers must not contain out of heap pointers: a derived
+           pointer live across the back edge of a loop is live across that
+           loop's poll, and the collector cannot update it. Where the unit is
+           compiled without polling there is no such safepoint, and
+           [Cmm_strength_reduction] carries row pointers across loops that it
+           has also shown cannot allocate. Emit.ml still refuses an [Addr] live
+           at any frame descriptor, so a mistake is a compile error. *)
+        let carried_pointers_are_safe =
+          (not Config.poll_insertion) || !Oxcaml_flags.disable_poll_insertion
+        in
         Array.iter
           (fun reg ->
             match reg.Reg.typ with
-            | Addr ->
+            | Addr when not carried_pointers_are_safe ->
               Misc.fatal_error
                 "Cfg_selectgen.emit_expr_exit: unexpected machtype_component \
                  Addr in Ccatch register"
+            | Addr -> ()
             | Valx2 -> Misc.fatal_error "Unexpected machtype_component Valx2"
             | Val | Int | Float | Vec128 | Vec256 | Vec512 | Mask | Float32 ->
               ())

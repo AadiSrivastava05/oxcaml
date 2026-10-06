@@ -172,6 +172,26 @@ let mk_no_cmm_strength_reduction f =
     Arg.Unit f,
     " Recompute loop-invariant array indices on every iteration" )
 
+let mk_cmm_invariant_strides f =
+  ( "-cmm-invariant-strides",
+    Arg.Unit f,
+    " Carry induction variables whose stride is loop-invariant" )
+
+let mk_no_cmm_invariant_strides f =
+  ( "-no-cmm-invariant-strides",
+    Arg.Unit f,
+    " Recompute induction variables with a non-constant stride" )
+
+let mk_cmm_carried_pointers f =
+  ( "-cmm-carried-pointers",
+    Arg.Unit f,
+    " Let a carried induction variable be a derived pointer" )
+
+let mk_no_cmm_carried_pointers f =
+  ( "-no-cmm-carried-pointers",
+    Arg.Unit f,
+    " Carry only integers out of a loop, never derived pointers" )
+
 let mk_cfg_stack_checks f =
   ( "-cfg-stack-checks",
     Arg.Unit f,
@@ -1361,6 +1381,10 @@ module type Oxcaml_options = sig
   val no_cmm_strength_reduction : unit -> unit
   val cmm_interior_pointers : unit -> unit
   val no_cmm_interior_pointers : unit -> unit
+  val cmm_invariant_strides : unit -> unit
+  val no_cmm_invariant_strides : unit -> unit
+  val cmm_carried_pointers : unit -> unit
+  val no_cmm_carried_pointers : unit -> unit
   val cfg_stack_checks : unit -> unit
   val no_cfg_stack_checks : unit -> unit
   val cfg_stack_checks_threshold : int -> unit
@@ -1561,6 +1585,10 @@ module Make_oxcaml_options (F : Oxcaml_options) = struct
       mk_no_cmm_strength_reduction F.no_cmm_strength_reduction;
       mk_cmm_interior_pointers F.cmm_interior_pointers;
       mk_no_cmm_interior_pointers F.no_cmm_interior_pointers;
+      mk_cmm_invariant_strides F.cmm_invariant_strides;
+      mk_no_cmm_invariant_strides F.no_cmm_invariant_strides;
+      mk_cmm_carried_pointers F.cmm_carried_pointers;
+      mk_no_cmm_carried_pointers F.no_cmm_carried_pointers;
       mk_cfg_stack_checks F.cfg_stack_checks;
       mk_no_cfg_stack_checks F.no_cfg_stack_checks;
       mk_cfg_stack_checks_threshold F.cfg_stack_checks_threshold;
@@ -1916,6 +1944,10 @@ module Oxcaml_options_impl = struct
   let no_cmm_strength_reduction = clear' Oxcaml_flags.cmm_strength_reduction
   let cmm_interior_pointers = set' Oxcaml_flags.cmm_interior_pointers
   let no_cmm_interior_pointers = clear' Oxcaml_flags.cmm_interior_pointers
+  let cmm_invariant_strides = set' Oxcaml_flags.cmm_invariant_strides
+  let no_cmm_invariant_strides = clear' Oxcaml_flags.cmm_invariant_strides
+  let cmm_carried_pointers = set' Oxcaml_flags.cmm_carried_pointers
+  let no_cmm_carried_pointers = clear' Oxcaml_flags.cmm_carried_pointers
   let cfg_stack_checks = set' Oxcaml_flags.cfg_stack_checks
   let no_cfg_stack_checks = clear' Oxcaml_flags.cfg_stack_checks
 
@@ -2518,6 +2550,8 @@ module Extra_params = struct
     | "x86-peephole-optimize" -> set' Oxcaml_flags.x86_peephole_optimize
     | "cmm-strength-reduction" -> set' Oxcaml_flags.cmm_strength_reduction
     | "cmm-interior-pointers" -> set' Oxcaml_flags.cmm_interior_pointers
+    | "cmm-invariant-strides" -> set' Oxcaml_flags.cmm_invariant_strides
+    | "cmm-carried-pointers" -> set' Oxcaml_flags.cmm_carried_pointers
     | "cfg-stack-checks" -> set' Oxcaml_flags.cfg_stack_checks
     | "cfg-eliminate-dead-trap-handlers" ->
         set' Oxcaml_flags.cfg_eliminate_dead_trap_handlers

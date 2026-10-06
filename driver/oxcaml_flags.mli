@@ -42,6 +42,10 @@ val cmm_strength_reduction : bool ref
 
 val cmm_interior_pointers : bool ref
 
+val cmm_invariant_strides : bool ref
+
+val cmm_carried_pointers : bool ref
+
 val cfg_stack_checks : bool ref
 val cfg_stack_checks_threshold : int ref
 
