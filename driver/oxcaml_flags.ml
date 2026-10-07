@@ -45,6 +45,8 @@ let cmm_invariant_strides = ref true    (* -[no-]cmm-invariant-strides *)
 
 let cmm_carried_pointers = ref true     (* -[no-]cmm-carried-pointers *)
 
+let cmm_licm = ref true                 (* -[no-]cmm-licm *)
+
 let cfg_stack_checks = ref true         (* -[no-]cfg-stack-check *)
 let cfg_stack_checks_threshold = ref 16384 (* -cfg-stack-threshold *)
 

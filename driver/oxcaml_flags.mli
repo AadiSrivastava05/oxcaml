@@ -46,6 +46,8 @@ val cmm_invariant_strides : bool ref
 
 val cmm_carried_pointers : bool ref
 
+val cmm_licm : bool ref
+
 val cfg_stack_checks : bool ref
 val cfg_stack_checks_threshold : int ref
 

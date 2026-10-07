@@ -91,6 +91,22 @@ let rec bound_variables acc expr =
   iter_subexpressions (fun sub -> acc := bound_variables !acc sub) expr;
   !acc
 
+(* How many times each variable is read in [expr]. *)
+let occurrence_counts expr =
+  let counts = ref V.Map.empty in
+  let rec loop expr =
+    (match expr with
+    | Cvar v ->
+      counts
+        := V.Map.update v
+             (function None -> Some 1 | Some n -> Some (n + 1))
+             !counts
+    | _ -> ());
+    iter_subexpressions loop expr
+  in
+  loop expr;
+  !counts
+
 (* Variables bound more than once in a function body. [Cmm] is normally in
    single-binding form, but expressions do get duplicated on the way here, and
    the analysis below reasons about a variable from its binding, so a variable
@@ -1208,13 +1224,98 @@ let reduce_invariant_strides ~duplicated ~int_vars ~relaxed ~carry_pointers
   let expr = Ccatch (flag, handlers, add_exit_args ~label ~extra body) in
   List.map (fun (def, var) -> var, def) !steps, expr
 
+(* {1 Loop-invariant code motion}
+
+   flambda2 has no loop-invariant code motion, so a computation that depends on
+   nothing the loop changes is still evaluated on every iteration. The row loop
+   of a matrix product recomputes the inner loop's trip count from the column
+   count every time round: five instructions in front of an inner loop of
+   thirteen, none of which depend on the row.
+
+   A [Clet] in a loop body whose defining expression reads only variables bound
+   outside the whole [Ccatch] is bound before the loop instead. Restricted to
+   the pure, total integer operations, because moving a binding out from under a
+   conditional evaluates it on a path that did not reach it, and only a total
+   operation may be evaluated there. The restriction on reading a variable not
+   known to hold an integer is the one above, for the same reason: reading it
+   once instead of once per iteration is the same computation only if nothing
+   can move it in between.
+
+   Chains are followed, since a variable already hoisted is bound outside by the
+   time the next one is considered. *)
+
+(* At most this many bindings leave one loop. Each one trades an evaluation per
+   iteration for a live range across the whole loop, which is only a win while
+   there are registers left to hold them. *)
+let max_hoisted = 4
+
+let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
+  let flag, handlers, body =
+    match expr with
+    | Ccatch (flag, handlers, body) -> flag, handlers, body
+    | _ -> raise Not_applicable
+  in
+  let bound_inside = bound_variables V.Set.empty expr in
+  let hoisted = ref [] in
+  let already = ref V.Set.empty in
+  let invariant v = (not (V.Set.mem v bound_inside)) || V.Set.mem v !already in
+  (* A variable or a constant is already as cheap as it can be, and hoisting one
+     only lengthens its live range. *)
+  let worth def =
+    match def with
+    | Cvar _ | Cconst_int _ | Cconst_natint _ -> false
+    | _ -> true
+  in
+  (* Hoisting moves an evaluation out of the loop and a value into it, so it
+     only pays where the operands die as a result. A variable this definition
+     reads that is read anywhere else stays live across the loop regardless, and
+     then the binding costs a register instead of saving one -- which on a loop
+     already at the limit means a reload per iteration in place of a computation
+     per iteration of the loop above it. This is the register-neutrality
+     condition [reduce] applies to its invariant, for the same reason. *)
+  let operands_die def =
+    V.Map.for_all
+      (fun v n ->
+        match V.Map.find_opt v counts with
+        | Some total -> Int.equal total n
+        | None -> false)
+      (occurrence_counts def)
+  in
+  let hoistable v def =
+    (not (V.Set.mem v duplicated))
+    && List.compare_length_with !hoisted max_hoisted < 0
+    && worth def
+    && invariant_int ~invariant ~int_vars ~relaxed def
+    && operands_die def
+  in
+  let rec loop expr =
+    match expr with
+    | Clet (v, def, inner) when hoistable (VP.var v) def ->
+      hoisted := (VP.var v, def) :: !hoisted;
+      already := V.Set.add (VP.var v) !already;
+      loop inner
+    | _ -> map_subexpressions loop expr
+  in
+  let handlers =
+    List.map
+      (fun (handler : static_handler) ->
+        { handler with body = loop handler.body })
+      handlers
+  in
+  match !hoisted with
+  | [] -> raise Not_applicable
+  (* Accumulated by prepending, so the first one hoisted is last in the list and
+     the driver, folding left, binds it outermost -- which is what the ones
+     after it may refer to. *)
+  | _ :: _ -> !hoisted, Ccatch (flag, handlers, body)
+
 (* {1 Driver} *)
 
 let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
-    ~invariant_strides ~carry_pointers int_vars expr =
+    ~invariant_strides ~carry_pointers ~licm ~counts int_vars expr =
   let rewrite =
     rewrite ~duplicated ~strength_reduction ~form_interior_pointers
-      ~invariant_strides ~carry_pointers
+      ~invariant_strides ~carry_pointers ~licm ~counts
   in
   match expr with
   | Clet (v, def, body) ->
@@ -1239,7 +1340,23 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
     match flag with
     | Normal | Exn_handler -> expr
     | Recursive ->
-      (* Interior pointers first. Where they fire they subsume the strength
+      (* Reading a variable once before the loop instead of once per iteration
+         is the same computation only where nothing can move it in between, and
+         a pointer may only be derived where nothing can move it at all. *)
+      let relaxed = form_interior_pointers && is_gc_free expr in
+      (* Invariants first: what leaves the loop here is bound outside it, so the
+         passes below may treat it as loop-invariant. *)
+      let hoisted, expr =
+        if not (licm && relaxed)
+        then [], expr
+        else
+          match
+            hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr
+          with
+          | hoisted, expr -> hoisted, expr
+          | exception Not_applicable -> [], expr
+      in
+      (* Interior pointers next. Where they fire they subsume the strength
          reduction: a fixed base plus the loop counter is strictly better than a
          running index, and the sum [b + i] the strength reduction looks for is
          gone from the addresses it rewrote, so the two cannot both fire on one
@@ -1272,7 +1389,6 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
          row length, which is a loop-invariant value rather than a constant, so
          [reduce] cannot carry it and every row rebuilds the pointer from the
          row index. *)
-      let relaxed = form_interior_pointers && is_gc_free expr in
       let bindings, expr =
         if not (strength_reduction && invariant_strides && relaxed)
         then bindings, expr
@@ -1289,7 +1405,7 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
       in
       List.fold_left
         (fun expr (var, def) -> Clet (VP.create var, def, expr))
-        expr bindings)
+        expr (bindings @ hoisted))
   | _ -> map_subexpressions (rewrite int_vars) expr
 
 (* Interior pointers are only correct where no collection can happen, and a loop
@@ -1312,6 +1428,7 @@ let fundecl (fundecl : fundecl) =
     !Oxcaml_flags.cmm_interior_pointers && polls_are_impossible fundecl
   in
   let invariant_strides = !Oxcaml_flags.cmm_invariant_strides in
+  let licm = !Oxcaml_flags.cmm_licm in
   (* A carried pointer is live across the loop's back edge, which is where a
      poll would go, so it is only representable where the whole unit is compiled
      without polling; [Cfg_selectgen] admits an [Addr] in a [Ccatch] register
@@ -1320,14 +1437,16 @@ let fundecl (fundecl : fundecl) =
     !Oxcaml_flags.cmm_carried_pointers
     && ((not Config.poll_insertion) || !Oxcaml_flags.disable_poll_insertion)
   in
-  if not (strength_reduction || form_interior_pointers)
+  if not (strength_reduction || form_interior_pointers || licm)
   then fundecl
   else
     let params = List.map (fun (param, _) -> VP.var param) fundecl.fun_args in
     let duplicated = duplicate_binders ~params fundecl.fun_body in
     let int_vars = add_int_params ~duplicated V.Set.empty fundecl.fun_args in
+    let counts = occurrence_counts fundecl.fun_body in
     { fundecl with
       fun_body =
         rewrite ~duplicated ~strength_reduction ~form_interior_pointers
-          ~invariant_strides ~carry_pointers int_vars fundecl.fun_body
+          ~invariant_strides ~carry_pointers ~licm ~counts int_vars
+          fundecl.fun_body
     }

@@ -192,6 +192,16 @@ let mk_no_cmm_carried_pointers f =
     Arg.Unit f,
     " Carry only integers out of a loop, never derived pointers" )
 
+let mk_cmm_licm f =
+  ( "-cmm-licm",
+    Arg.Unit f,
+    " Bind loop-invariant integer computations before the loop" )
+
+let mk_no_cmm_licm f =
+  ( "-no-cmm-licm",
+    Arg.Unit f,
+    " Recompute loop-invariant integer expressions on every iteration" )
+
 let mk_cfg_stack_checks f =
   ( "-cfg-stack-checks",
     Arg.Unit f,
@@ -1385,6 +1395,8 @@ module type Oxcaml_options = sig
   val no_cmm_invariant_strides : unit -> unit
   val cmm_carried_pointers : unit -> unit
   val no_cmm_carried_pointers : unit -> unit
+  val cmm_licm : unit -> unit
+  val no_cmm_licm : unit -> unit
   val cfg_stack_checks : unit -> unit
   val no_cfg_stack_checks : unit -> unit
   val cfg_stack_checks_threshold : int -> unit
@@ -1589,6 +1601,8 @@ module Make_oxcaml_options (F : Oxcaml_options) = struct
       mk_no_cmm_invariant_strides F.no_cmm_invariant_strides;
       mk_cmm_carried_pointers F.cmm_carried_pointers;
       mk_no_cmm_carried_pointers F.no_cmm_carried_pointers;
+      mk_cmm_licm F.cmm_licm;
+      mk_no_cmm_licm F.no_cmm_licm;
       mk_cfg_stack_checks F.cfg_stack_checks;
       mk_no_cfg_stack_checks F.no_cfg_stack_checks;
       mk_cfg_stack_checks_threshold F.cfg_stack_checks_threshold;
@@ -1948,6 +1962,8 @@ module Oxcaml_options_impl = struct
   let no_cmm_invariant_strides = clear' Oxcaml_flags.cmm_invariant_strides
   let cmm_carried_pointers = set' Oxcaml_flags.cmm_carried_pointers
   let no_cmm_carried_pointers = clear' Oxcaml_flags.cmm_carried_pointers
+  let cmm_licm = set' Oxcaml_flags.cmm_licm
+  let no_cmm_licm = clear' Oxcaml_flags.cmm_licm
   let cfg_stack_checks = set' Oxcaml_flags.cfg_stack_checks
   let no_cfg_stack_checks = clear' Oxcaml_flags.cfg_stack_checks
 
@@ -2552,6 +2568,7 @@ module Extra_params = struct
     | "cmm-interior-pointers" -> set' Oxcaml_flags.cmm_interior_pointers
     | "cmm-invariant-strides" -> set' Oxcaml_flags.cmm_invariant_strides
     | "cmm-carried-pointers" -> set' Oxcaml_flags.cmm_carried_pointers
+    | "cmm-licm" -> set' Oxcaml_flags.cmm_licm
     | "cfg-stack-checks" -> set' Oxcaml_flags.cfg_stack_checks
     | "cfg-eliminate-dead-trap-handlers" ->
         set' Oxcaml_flags.cfg_eliminate_dead_trap_handlers
