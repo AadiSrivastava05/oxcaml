@@ -1384,13 +1384,22 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
         let tmp_regs = Reg.createv_with_typs src in
         (* Ccatch registers must not contain out of heap pointers: a derived
            pointer live across the back edge of a loop is live across that
-           loop's poll, and the collector cannot update it. Where the unit is
-           compiled without polling there is no such safepoint, and
-           [Cmm_strength_reduction] carries row pointers across loops that it
-           has also shown cannot allocate. Emit.ml still refuses an [Addr] live
-           at any frame descriptor, so a mistake is a compile error. *)
+           loop's poll, and the collector cannot update it. Where there is no
+           safepoint there is no such poll, and [Cmm_strength_reduction]
+           carries row pointers only across loops it has also shown cannot
+           allocate. That holds when the unit is compiled without polling, and
+           equally when this one function is annotated [@poll error], which
+           makes any remaining polling point a compile error -- so a kernel can
+           opt in without the program around it giving up its safepoints.
+           Emit.ml still refuses an [Addr] live at any frame descriptor, so a
+           mistake is a compile error either way. *)
         let carried_pointers_are_safe =
-          (not Config.poll_insertion) || !Oxcaml_flags.disable_poll_insertion
+          (not Config.poll_insertion)
+          || !Oxcaml_flags.disable_poll_insertion
+          ||
+          match !SU.current_function_poll with
+          | Lambda.Error_poll -> true
+          | Lambda.Default_poll -> false
         in
         Array.iter
           (fun reg ->
@@ -1709,6 +1718,7 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
 
   let emit_fundecl ~future_funcnames f =
     SU.current_function_name := f.Cmm.fun_name.sym_name;
+    SU.current_function_poll := f.Cmm.fun_poll;
     SU.current_function_is_check_enabled
       := Zero_alloc_checker.is_check_enabled f.Cmm.fun_codegen_options
            f.Cmm.fun_name.sym_name f.Cmm.fun_dbg;

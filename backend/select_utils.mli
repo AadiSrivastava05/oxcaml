@@ -122,6 +122,8 @@ val current_function_name : string ref
 
 val current_function_is_check_enabled : bool ref
 
+val current_function_poll : Lambda.poll_attribute ref
+
 module Effect : sig
   type t =
     | None

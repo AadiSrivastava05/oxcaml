@@ -1249,6 +1249,32 @@ let reduce_invariant_strides ~duplicated ~int_vars ~relaxed ~carry_pointers
    there are registers left to hold them. *)
 let max_hoisted = 4
 
+(* What it costs to recompute a definition once. Hoisting pays that cost once
+   instead of every iteration, in exchange for one value live across the loop.
+   An add or a shift is not worth a register: the addressing modes absorb those
+   for free, and spilling one value to save one [lea] is a loss. A multiply is,
+   at three to four cycles and a port the loop's arithmetic also wants. *)
+let rec recompute_cost expr =
+  let args_cost args = List.fold_left (fun n a -> n + recompute_cost a) 0 args in
+  match expr with
+  | Cconst_int _ | Cconst_natint _ | Cvar _ -> 0
+  | Cop (Cmuli, args, _) -> 3 + args_cost args
+  | Cop ((Caddi | Csubi | Cand | Cor | Cxor | Clsl | Clsr | Casr), args, _) ->
+    1 + args_cost args
+  | _ -> 1
+
+(* A definition this expensive earns its register even when no operand dies. *)
+let min_cost_under_pressure = 3
+
+(* How many such bindings may leave one loop, and how many values that loop may
+   already carry before none may. The loop already ties up one register per
+   carried value; below this there are enough left that one more live range
+   does not force a spill, and above it the measurement that produced this pass
+   says hoisting loses. *)
+let max_pressure_hoists = 2
+
+let max_carried_under_pressure = 6
+
 let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
   let flag, handlers, body =
     match expr with
@@ -1281,12 +1307,33 @@ let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
         | None -> false)
       (occurrence_counts def)
   in
+  (* Values the loop already holds in registers across its back edge. *)
+  let carried =
+    List.fold_left
+      (fun n (handler : static_handler) -> n + List.length handler.params)
+      0 handlers
+  in
+  let pressure_budget =
+    ref
+      (if carried <= max_carried_under_pressure then max_pressure_hoists else 0)
+  in
+  (* Register-neutral hoists are always taken. One that adds a live range is
+     taken only while there is budget for it and the computation it removes is
+     dear enough to pay for the register -- which is what lets an invariant
+     multiply leave a loop whose operands are all live elsewhere anyway. *)
+  let affordable def =
+    operands_die def
+    || recompute_cost def >= min_cost_under_pressure
+       && !pressure_budget > 0
+       && (decr pressure_budget;
+           true)
+  in
   let hoistable v def =
     (not (V.Set.mem v duplicated))
     && List.compare_length_with !hoisted max_hoisted < 0
     && worth def
     && invariant_int ~invariant ~int_vars ~relaxed def
-    && operands_die def
+    && affordable def
   in
   let rec loop expr =
     match expr with
@@ -1430,12 +1477,12 @@ let fundecl (fundecl : fundecl) =
   let invariant_strides = !Oxcaml_flags.cmm_invariant_strides in
   let licm = !Oxcaml_flags.cmm_licm in
   (* A carried pointer is live across the loop's back edge, which is where a
-     poll would go, so it is only representable where the whole unit is compiled
-     without polling; [Cfg_selectgen] admits an [Addr] in a [Ccatch] register
-     under exactly this condition. *)
+     poll would go, so it is only representable where that loop has no
+     safepoint: either the whole unit is compiled without polling, or this
+     function is annotated [@poll error]. [Cfg_selectgen] admits an [Addr] in a
+     [Ccatch] register under exactly the same condition. *)
   let carry_pointers =
-    !Oxcaml_flags.cmm_carried_pointers
-    && ((not Config.poll_insertion) || !Oxcaml_flags.disable_poll_insertion)
+    !Oxcaml_flags.cmm_carried_pointers && polls_are_impossible fundecl
   in
   if not (strength_reduction || form_interior_pointers || licm)
   then fundecl
