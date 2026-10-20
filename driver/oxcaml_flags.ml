@@ -52,8 +52,11 @@ let cmm_licm = ref true                 (* -[no-]cmm-licm *)
 let cmm_counted_loops = ref false       (* -[no-]cmm-counted-loops *)
 
 (* The same without the termination proof: every loop loses its back-edge
-   poll unless it waits for another domain, so one that never ends and never
-   allocates or calls never polls. *)
+   poll, so one that never ends and never allocates or calls never polls. This
+   costs liveness only -- such a loop can hang the program, for instance by
+   keeping a stop-the-world collection waiting -- never what a program
+   computes. Loops that look like they wait for another domain keep their
+   poll, but that is a heuristic. *)
 let cmm_unchecked_loops = ref false     (* -[no-]cmm-unchecked-loops *)
 
 let dump_counted_loops = ref false      (* -dcounted-loops *)

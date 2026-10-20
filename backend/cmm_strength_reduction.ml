@@ -555,18 +555,75 @@ let rec contains_polled_loop expr =
       expr;
     !found
 
-(* Does [expr] wait for another domain: spin on [Domain.cpu_relax] or read an
-   atomic? Such a loop ends only when another domain acts, and that domain may
-   itself be waiting for this one to poll -- to join a stop-the-world
-   collection -- so without its poll the two deadlock. With polling on,
-   [Domain.cpu_relax] is a bare [pause] that relies on the back-edge poll. *)
+(* Does [expr] look like it waits for another domain: spin on
+   [Domain.cpu_relax] or on any atomic operation? Such a loop ends only when
+   another domain acts, and that domain may itself be waiting for this one to
+   poll -- to join a stop-the-world collection -- so without its poll the two
+   deadlock. With polling on, [Domain.cpu_relax] is a bare [pause] that relies
+   on the back-edge poll. This is a heuristic, not a proof: a loop that waits
+   through a plain reference, a signal or a C call is not recognised. *)
 let rec waits_for_other_domains expr =
   match expr with
-  | Cop ((Cpause | Cload { is_atomic = true; _ }), _, _) -> true
+  | Cop ((Cpause | Catomic _ | Cload { is_atomic = true; _ }), _, _) -> true
+  | Cop (Cextcall { func; _ }, _, _)
+    when String.starts_with ~prefix:"caml_atomic_" func ->
+    true
   | _ ->
     let found = ref false in
     iter_subexpressions
       (fun sub -> if not !found then found := waits_for_other_domains sub)
+      expr;
+    !found
+
+(* Does [expr] make a call in tail position? Its exit poll would follow that
+   call, which would then no longer be a tail call: a loop that recursed in
+   constant stack would overflow it. *)
+let rec has_tail_call expr =
+  match expr with
+  | Cop (Capply { region = Rc_normal; _ }, _, _) -> true
+  | Clet (_, _, body)
+  | Cphantom_let (_, _, body)
+  | Cname_for_debugger (_, body)
+  | Csequence (_, body) ->
+    has_tail_call body
+  | Cifthenelse (_, _, ifso, _, ifnot, _) ->
+    has_tail_call ifso || has_tail_call ifnot
+  | Cswitch (_, _, cases, _) ->
+    Array.exists (fun (case, _) -> has_tail_call case) cases
+  | Ccatch (_, handlers, body) ->
+    has_tail_call body
+    || List.exists
+         (fun (handler : static_handler) -> has_tail_call handler.body)
+         handlers
+  | _ -> false
+
+(* Does [expr] push an exception handler? An exit that pops it would poll
+   before the pop, where an exception raised by a signal handler at that poll
+   would reach a handler that no poll of the original loop could reach. *)
+let rec pushes_a_trap expr =
+  match expr with
+  | Cexit (_, _, traps)
+    when List.exists (function Push _ -> true | Pop _ -> false) traps ->
+    true
+  | _ ->
+    let found = ref false in
+    iter_subexpressions
+      (fun sub -> if not !found then found := pushes_a_trap sub)
+      expr;
+    !found
+
+(* Does [expr] contain a loop that has lost its back-edge poll? *)
+let rec contains_bounded_loop expr =
+  match expr with
+  | Ccatch (Recursive, handlers, _)
+    when List.exists
+           (fun (handler : static_handler) -> handler.is_bounded)
+           handlers ->
+    true
+  | _ ->
+    let found = ref false in
+    iter_subexpressions
+      (fun sub -> if not !found then found := contains_bounded_loop sub)
       expr;
     !found
 
@@ -1690,8 +1747,8 @@ let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
 
 let counted_loops_enabled = ref false
 
-(* -cmm-unchecked-loops: every loop that does not wait for another domain is
-   made poll-free, whether or not it terminates. *)
+(* -cmm-unchecked-loops: loops are made poll-free whether or not they
+   terminate. This may cost liveness, never correctness. *)
 let unchecked_loops_enabled = ref false
 
 let found_counted = ref false
@@ -2052,6 +2109,35 @@ let rec add_exit_polls ~in_polled_loop expr =
           add_exit_polls ~in_polled_loop body )
   | _ -> map_subexpressions (add_exit_polls ~in_polled_loop) expr
 
+(* A loop that keeps its poll and has a poll-free loop inside polls at its head
+   instead of relying on [Cfg_polling]. That pass recognises a poll-free loop by
+   its header label alone: when the enclosing loop's header block is empty --
+   its body starts with the inner loop -- [Cfg_simplify] removes it, the
+   enclosing loop's back edge lands on the inner header, and its poll is lost.
+   No derived pointer is live here: a loop with a polled loop inside is given
+   no pointer passes. *)
+let rec poll_at_heads expr =
+  match expr with
+  | Ccatch (Recursive, handlers, body)
+    when not
+           (List.exists
+              (fun (handler : static_handler) -> handler.is_bounded)
+              handlers) ->
+    Ccatch
+      ( Recursive,
+        List.map
+          (fun (handler : static_handler) ->
+            let polled = poll_at_heads handler.body in
+            { handler with
+              body =
+                (if contains_bounded_loop handler.body
+                 then Csequence (Cop (Cpoll, [], handler.dbg), polled)
+                 else polled)
+            })
+          handlers,
+        poll_at_heads body )
+  | _ -> map_subexpressions poll_at_heads expr
+
 (* A copy of [expr] in which every label and variable bound inside it is
    renamed, so that it can stand next to the original. Debugger-only bindings
    are dropped from the copy. *)
@@ -2411,6 +2497,8 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
               let node = Ccatch (Recursive, [handler], entry) in
               if not (is_gc_free node)
               then decline "a GC point inside"
+              else if pushes_a_trap node
+              then decline "an exception handler inside"
               else if contains_polled_loop body || contains_polled_loop entry
               then decline "a loop inside that keeps its poll"
               else
@@ -2437,12 +2525,15 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
           | _, _ -> None
       in
       (* Without the termination proof every loop loses its back-edge poll
-         except one that waits for another domain, and gets the exit polls of
-         a counted loop. Only a GC-free loop with no polled loop inside is also
-         given the pointer passes: across a call, an allocation, or an inner
-         loop's poll, a derived pointer would be a bad GC root. A call or an
-         allocation still polls; a path through the loop that reaches neither
-         no longer does. *)
+         except one that looks like it waits for another domain, and gets the
+         exit polls of a counted loop. Two more keep their poll because exit
+         polls would change what they compute, not just when they poll: one
+         with a tail call, which would stop being one, and one that pushes an
+         exception handler, which an exit poll would sit inside of. Only a
+         GC-free loop with no polled loop inside is also given the pointer
+         passes: across a call, an allocation, or an inner loop's poll, a
+         derived pointer would be a bad GC root. A call or an allocation still
+         polls; a path through the loop that reaches neither no longer does. *)
       let unchecked =
         if not (!unchecked_loops_enabled && not form_interior_pointers)
         then None
@@ -2453,6 +2544,14 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
             if waits_for_other_domains expr
             then (
               report ~dbg "keeps its poll: it waits for another domain";
+              None)
+            else if has_tail_call expr
+            then (
+              report ~dbg "keeps its poll: a tail call inside";
+              None)
+            else if pushes_a_trap expr
+            then (
+              report ~dbg "keeps its poll: an exception handler inside";
               None)
             else
               let pointer_passes =
@@ -2480,8 +2579,9 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
       match unchecked, counted with
       | Some (handlers, entry, true), _ ->
         found_counted := true;
-        pipeline ~gc_free:true ~form_interior_pointers:true ~carry_pointers:true
-          ~handlers
+        pipeline ~gc_free:true
+          ~form_interior_pointers:!Oxcaml_flags.cmm_interior_pointers
+          ~carry_pointers:!Oxcaml_flags.cmm_carried_pointers ~handlers
           (Ccatch (Recursive, handlers, entry))
       | Some (handlers, entry, false), _ ->
         found_counted := true;
@@ -2498,8 +2598,10 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
           | _ -> node
         in
         let expr =
-          pipeline ~gc_free:true ~form_interior_pointers:true
-            ~carry_pointers:true ~handlers:[fast] expr
+          pipeline ~gc_free:true
+            ~form_interior_pointers:!Oxcaml_flags.cmm_interior_pointers
+            ~carry_pointers:!Oxcaml_flags.cmm_carried_pointers ~handlers:[fast]
+            expr
         in
         match pre with
         | Always | Never -> expr
@@ -2583,6 +2685,8 @@ let fundecl (fundecl : fundecl) =
         fundecl.fun_body
     in
     let body =
-      if !found_counted then add_exit_polls ~in_polled_loop:false body else body
+      if !found_counted
+      then poll_at_heads (add_exit_polls ~in_polled_loop:false body)
+      else body
     in
     { fundecl with fun_body = body }

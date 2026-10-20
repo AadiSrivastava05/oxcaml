@@ -211,8 +211,9 @@ let mk_cmm_counted_loops f =
 let mk_cmm_unchecked_loops f =
   ( "-cmm-unchecked-loops",
     Arg.Unit f,
-    " Drop the back-edge poll of every loop, terminating or not, except one "
-    ^ "that waits for another domain, and poll once on its exits" )
+    " Drop the back-edge poll of every loop, terminating or not, and poll "
+    ^ "once on its exits. A loop that never ends may hang the program "
+    ^ "(liveness only)" )
 
 let mk_no_cmm_unchecked_loops f =
   ( "-no-cmm-unchecked-loops",
