@@ -208,6 +208,17 @@ let mk_cmm_counted_loops f =
     " Drop the back-edge poll of a GC-free loop that provably terminates, "
     ^ "and poll once on its exits" )
 
+let mk_cmm_unchecked_loops f =
+  ( "-cmm-unchecked-loops",
+    Arg.Unit f,
+    " Drop the back-edge poll of every loop, terminating or not, except one "
+    ^ "that waits for another domain, and poll once on its exits" )
+
+let mk_no_cmm_unchecked_loops f =
+  ( "-no-cmm-unchecked-loops",
+    Arg.Unit f,
+    " Keep the back-edge poll of a loop not proved to terminate" )
+
 let mk_dcounted_loops f =
   ( "-dcounted-loops",
     Arg.Unit f,
@@ -1415,6 +1426,8 @@ module type Oxcaml_options = sig
   val no_cmm_licm : unit -> unit
   val cmm_counted_loops : unit -> unit
   val no_cmm_counted_loops : unit -> unit
+  val cmm_unchecked_loops : unit -> unit
+  val no_cmm_unchecked_loops : unit -> unit
   val dcounted_loops : unit -> unit
   val cfg_stack_checks : unit -> unit
   val no_cfg_stack_checks : unit -> unit
@@ -1624,6 +1637,8 @@ module Make_oxcaml_options (F : Oxcaml_options) = struct
       mk_no_cmm_licm F.no_cmm_licm;
       mk_cmm_counted_loops F.cmm_counted_loops;
       mk_no_cmm_counted_loops F.no_cmm_counted_loops;
+      mk_cmm_unchecked_loops F.cmm_unchecked_loops;
+      mk_no_cmm_unchecked_loops F.no_cmm_unchecked_loops;
       mk_dcounted_loops F.dcounted_loops;
       mk_cfg_stack_checks F.cfg_stack_checks;
       mk_no_cfg_stack_checks F.no_cfg_stack_checks;
@@ -1988,6 +2003,8 @@ module Oxcaml_options_impl = struct
   let no_cmm_licm = clear' Oxcaml_flags.cmm_licm
   let cmm_counted_loops = set' Oxcaml_flags.cmm_counted_loops
   let no_cmm_counted_loops = clear' Oxcaml_flags.cmm_counted_loops
+  let cmm_unchecked_loops = set' Oxcaml_flags.cmm_unchecked_loops
+  let no_cmm_unchecked_loops = clear' Oxcaml_flags.cmm_unchecked_loops
   let dcounted_loops = set' Oxcaml_flags.dump_counted_loops
   let cfg_stack_checks = set' Oxcaml_flags.cfg_stack_checks
   let no_cfg_stack_checks = clear' Oxcaml_flags.cfg_stack_checks
@@ -2595,6 +2612,7 @@ module Extra_params = struct
     | "cmm-carried-pointers" -> set' Oxcaml_flags.cmm_carried_pointers
     | "cmm-licm" -> set' Oxcaml_flags.cmm_licm
     | "cmm-counted-loops" -> set' Oxcaml_flags.cmm_counted_loops
+    | "cmm-unchecked-loops" -> set' Oxcaml_flags.cmm_unchecked_loops
     | "cfg-stack-checks" -> set' Oxcaml_flags.cfg_stack_checks
     | "cfg-eliminate-dead-trap-handlers" ->
         set' Oxcaml_flags.cfg_eliminate_dead_trap_handlers

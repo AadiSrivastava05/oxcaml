@@ -62,6 +62,8 @@ module type Oxcaml_options = sig
   val no_cmm_licm : unit -> unit
   val cmm_counted_loops : unit -> unit
   val no_cmm_counted_loops : unit -> unit
+  val cmm_unchecked_loops : unit -> unit
+  val no_cmm_unchecked_loops : unit -> unit
   val dcounted_loops : unit -> unit
   val cfg_stack_checks : unit -> unit
   val no_cfg_stack_checks : unit -> unit

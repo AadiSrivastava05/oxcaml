@@ -51,6 +51,11 @@ let cmm_licm = ref true                 (* -[no-]cmm-licm *)
    testsuite has been run with them. See cmm_strength_reduction.ml. *)
 let cmm_counted_loops = ref false       (* -[no-]cmm-counted-loops *)
 
+(* The same without the termination proof: every loop loses its back-edge
+   poll unless it waits for another domain, so one that never ends and never
+   allocates or calls never polls. *)
+let cmm_unchecked_loops = ref false     (* -[no-]cmm-unchecked-loops *)
+
 let dump_counted_loops = ref false      (* -dcounted-loops *)
 
 let cfg_stack_checks = ref true         (* -[no-]cfg-stack-check *)

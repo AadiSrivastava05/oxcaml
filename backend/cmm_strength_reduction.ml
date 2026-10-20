@@ -555,6 +555,21 @@ let rec contains_polled_loop expr =
       expr;
     !found
 
+(* Does [expr] wait for another domain: spin on [Domain.cpu_relax] or read an
+   atomic? Such a loop ends only when another domain acts, and that domain may
+   itself be waiting for this one to poll -- to join a stop-the-world
+   collection -- so without its poll the two deadlock. With polling on,
+   [Domain.cpu_relax] is a bare [pause] that relies on the back-edge poll. *)
+let rec waits_for_other_domains expr =
+  match expr with
+  | Cop ((Cpause | Cload { is_atomic = true; _ }), _, _) -> true
+  | _ ->
+    let found = ref false in
+    iter_subexpressions
+      (fun sub -> if not !found then found := waits_for_other_domains sub)
+      expr;
+    !found
+
 (* {2 Address expressions}
 
    [{ root; scale; index; disp }] denotes [root + scale * index + disp]. At most
@@ -1675,6 +1690,10 @@ let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
 
 let counted_loops_enabled = ref false
 
+(* -cmm-unchecked-loops: every loop that does not wait for another domain is
+   made poll-free, whether or not it terminates. *)
+let unchecked_loops_enabled = ref false
+
 let found_counted = ref false
 
 (* The [Clet] definitions of the whole function, for [range]. *)
@@ -2368,7 +2387,11 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
          back-edge poll -- it polls on its exits instead -- so inside it the
          passes run as they would on a unit compiled without polling. *)
       let counted =
-        if not (!counted_loops_enabled && not form_interior_pointers)
+        if
+          not
+            (!counted_loops_enabled
+            && (not !unchecked_loops_enabled)
+            && not form_interior_pointers)
         then None
         else
           match expr, handlers with
@@ -2413,9 +2436,60 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
             None
           | _, _ -> None
       in
-      match counted with
-      | None -> pipeline ~form_interior_pointers ~carry_pointers ~handlers expr
-      | Some (original, handler, node, guard, pre) -> (
+      (* Without the termination proof every loop loses its back-edge poll
+         except one that waits for another domain, and gets the exit polls of
+         a counted loop. Only a GC-free loop with no polled loop inside is also
+         given the pointer passes: across a call, an allocation, or an inner
+         loop's poll, a derived pointer would be a bad GC root. A call or an
+         allocation still polls; a path through the loop that reaches neither
+         no longer does. *)
+      let unchecked =
+        if not (!unchecked_loops_enabled && not form_interior_pointers)
+        then None
+        else
+          match expr, handlers with
+          | Ccatch (_, _, entry), (first :: _ as handlers) ->
+            let dbg = first.dbg in
+            if waits_for_other_domains expr
+            then (
+              report ~dbg "keeps its poll: it waits for another domain";
+              None)
+            else
+              let pointer_passes =
+                is_gc_free expr
+                && (not (contains_polled_loop entry))
+                && not
+                     (List.exists
+                        (fun (handler : static_handler) ->
+                          contains_polled_loop handler.body)
+                        handlers)
+              in
+              report ~dbg
+                (if pointer_passes
+                 then "poll-free, termination not checked"
+                 else "poll-free, termination not checked, GC points inside");
+              Some
+                ( List.map
+                    (fun (handler : static_handler) ->
+                      { handler with is_bounded = true })
+                    handlers,
+                  entry,
+                  pointer_passes )
+          | _, _ -> None
+      in
+      match unchecked, counted with
+      | Some (handlers, entry, true), _ ->
+        found_counted := true;
+        pipeline ~gc_free:true ~form_interior_pointers:true ~carry_pointers:true
+          ~handlers
+          (Ccatch (Recursive, handlers, entry))
+      | Some (handlers, entry, false), _ ->
+        found_counted := true;
+        pipeline ~form_interior_pointers ~carry_pointers ~handlers
+          (Ccatch (Recursive, handlers, entry))
+      | None, None ->
+        pipeline ~form_interior_pointers ~carry_pointers ~handlers expr
+      | None, Some (original, handler, node, guard, pre) -> (
         found_counted := true;
         let fast = { handler with is_bounded = true } in
         let expr =
@@ -2457,6 +2531,16 @@ let polls_are_impossible (fundecl : fundecl) =
   | Lambda.Error_poll -> true
   | Lambda.Default_poll -> false
 
+(* Does [Cfg_polling] put polls in this function? Dropping a back-edge poll
+   needs one to drop, and the exit polls that replace it would be new
+   safepoints in a function such as [caml_send*], which keeps a derived pointer
+   live across its loop because it is never polled. *)
+let polls_are_inserted (fundecl : fundecl) =
+  (not (polls_are_impossible fundecl))
+  && not
+       (Cfg_polling.function_is_assumed_to_never_poll
+          fundecl.fun_name.sym_name)
+
 let fundecl (fundecl : fundecl) =
   let strength_reduction = !Oxcaml_flags.cmm_strength_reduction in
   let form_interior_pointers =
@@ -2475,15 +2559,17 @@ let fundecl (fundecl : fundecl) =
   (* The proofs above are about 64-bit words, computed with a 64-bit host. *)
   counted_loops_enabled
     := !Oxcaml_flags.cmm_counted_loops
-       && (not (polls_are_impossible fundecl))
+       && polls_are_inserted fundecl
        && Arch.size_int = 8 && Nativeint.size = 64;
+  unchecked_loops_enabled
+    := !Oxcaml_flags.cmm_unchecked_loops && polls_are_inserted fundecl;
   found_counted := false;
   versioned_loops := [];
   current_function := fundecl.fun_name.sym_name;
   if
     not
       (strength_reduction || form_interior_pointers || licm
-     || !counted_loops_enabled)
+     || !counted_loops_enabled || !unchecked_loops_enabled)
   then fundecl
   else
     let params = List.map (fun (param, _) -> VP.var param) fundecl.fun_args in

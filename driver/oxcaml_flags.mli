@@ -50,6 +50,8 @@ val cmm_licm : bool ref
 
 val cmm_counted_loops : bool ref
 
+val cmm_unchecked_loops : bool ref
+
 val dump_counted_loops : bool ref
 
 val cfg_stack_checks : bool ref
