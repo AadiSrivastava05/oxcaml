@@ -38,6 +38,30 @@ let x86_peephole_remove_redundant_extension = ref true
 let x86_peephole_combine_add_rsp = ref true
 let x86_peephole_remove_redundant_test = ref true
 
+let cmm_strength_reduction = ref true   (* -[no-]cmm-strength-reduction *)
+
+let cmm_interior_pointers = ref true    (* -[no-]cmm-interior-pointers *)
+
+let cmm_invariant_strides = ref true    (* -[no-]cmm-invariant-strides *)
+
+let cmm_carried_pointers = ref true     (* -[no-]cmm-carried-pointers *)
+
+let cmm_licm = ref true                 (* -[no-]cmm-licm *)
+
+(* Interior pointers with polling on. Off by default until the OxCaml
+   testsuite has been run with them. See cmm_strength_reduction.ml. *)
+let cmm_counted_loops = ref false       (* -[no-]cmm-counted-loops *)
+
+(* The same without the termination proof: every loop loses its back-edge
+   poll, so one that never ends and never allocates or calls never polls. This
+   costs liveness only -- such a loop can hang the program, for instance by
+   keeping a stop-the-world collection waiting -- never what a program
+   computes. Loops that look like they wait for another domain keep their
+   poll, but that is a heuristic. *)
+let cmm_unchecked_loops = ref false     (* -[no-]cmm-unchecked-loops *)
+
+let dump_counted_loops = ref false      (* -dcounted-loops *)
+
 let cfg_stack_checks = ref true         (* -[no-]cfg-stack-check *)
 let cfg_stack_checks_threshold = ref 16384 (* -cfg-stack-threshold *)
 

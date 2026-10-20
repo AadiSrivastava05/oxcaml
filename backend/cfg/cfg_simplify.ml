@@ -145,6 +145,14 @@ end = struct
               Printf.printf "block at %s has single successor %s\n"
                 (Label.to_string label)
                 (Label.to_string target_label);
+            (* A loop header recorded as bounded may be an empty block that
+               only jumps into the loop body; dropping it moves the back edge's
+               destination to that body, so the mark has to move with it or
+               [Cfg_polling] will no longer recognise the loop. *)
+            if Label.Set.mem label cfg.bounded_loop_headers
+            then
+              cfg.bounded_loop_headers
+                <- Label.Set.add target_label cfg.bounded_loop_headers;
             (* Update successor block. *)
             let succ_block = C.get_block_exn cfg target_label in
             assert (Label.Set.mem label succ_block.predecessors);

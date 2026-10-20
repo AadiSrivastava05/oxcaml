@@ -1499,6 +1499,7 @@ let prepare_fun_info t (cfg : Cfg.t) =
         fun_frame_required = _ (* only available after prologue insertion *);
         fun_prologue_required = _ (* only available after prologue insertion *);
         fun_poll = _ (* not needed after poll insertion *);
+        bounded_loop_headers = _ (* only needed by poll insertion *);
         next_instruction_id = _;
         fun_ret_type;
         fun_phantom_lets = _;

@@ -153,6 +153,84 @@ let mk_no_cfg_zero_alloc_checker f =
     Arg.Unit f,
     " Do not apply zero_alloc checker to CFG" )
 
+let mk_cmm_strength_reduction f =
+  ( "-cmm-strength-reduction",
+    Arg.Unit f,
+    " Carry loop-invariant array indices in loop parameters" )
+
+let mk_cmm_interior_pointers f =
+  ( "-cmm-interior-pointers",
+    Arg.Unit f,
+    " Hoist array row addresses out of loops that cannot reach the GC" )
+
+let mk_no_cmm_interior_pointers f =
+  ( "-no-cmm-interior-pointers",
+    Arg.Unit f,
+    " Recompute array row addresses on every loop iteration" )
+
+let mk_no_cmm_strength_reduction f =
+  ( "-no-cmm-strength-reduction",
+    Arg.Unit f,
+    " Recompute loop-invariant array indices on every iteration" )
+
+let mk_cmm_invariant_strides f =
+  ( "-cmm-invariant-strides",
+    Arg.Unit f,
+    " Carry induction variables whose stride is loop-invariant" )
+
+let mk_no_cmm_invariant_strides f =
+  ( "-no-cmm-invariant-strides",
+    Arg.Unit f,
+    " Recompute induction variables with a non-constant stride" )
+
+let mk_cmm_carried_pointers f =
+  ( "-cmm-carried-pointers",
+    Arg.Unit f,
+    " Let a carried induction variable be a derived pointer" )
+
+let mk_no_cmm_carried_pointers f =
+  ( "-no-cmm-carried-pointers",
+    Arg.Unit f,
+    " Carry only integers out of a loop, never derived pointers" )
+
+let mk_cmm_licm f =
+  ( "-cmm-licm",
+    Arg.Unit f,
+    " Bind loop-invariant integer computations before the loop" )
+
+let mk_no_cmm_licm f =
+  ( "-no-cmm-licm",
+    Arg.Unit f,
+    " Recompute loop-invariant integer expressions on every iteration" )
+
+let mk_cmm_counted_loops f =
+  ( "-cmm-counted-loops",
+    Arg.Unit f,
+    " Drop the back-edge poll of a GC-free loop that provably terminates, "
+    ^ "and poll once on its exits" )
+
+let mk_cmm_unchecked_loops f =
+  ( "-cmm-unchecked-loops",
+    Arg.Unit f,
+    " Drop the back-edge poll of every loop, terminating or not, and poll "
+    ^ "once on its exits. A loop that never ends may hang the program "
+    ^ "(liveness only)" )
+
+let mk_no_cmm_unchecked_loops f =
+  ( "-no-cmm-unchecked-loops",
+    Arg.Unit f,
+    " Keep the back-edge poll of a loop not proved to terminate" )
+
+let mk_dcounted_loops f =
+  ( "-dcounted-loops",
+    Arg.Unit f,
+    " Print which loops -cmm-counted-loops makes poll-free, and why not" )
+
+let mk_no_cmm_counted_loops f =
+  ( "-no-cmm-counted-loops",
+    Arg.Unit f,
+    " Keep the back-edge poll of every loop" )
+
 let mk_cfg_stack_checks f =
   ( "-cfg-stack-checks",
     Arg.Unit f,
@@ -1356,6 +1434,21 @@ module type Oxcaml_options = sig
   val no_x86_peephole_remove_redundant_extension : unit -> unit
   val no_x86_peephole_combine_add_rsp : unit -> unit
   val no_x86_peephole_remove_redundant_test : unit -> unit
+  val cmm_strength_reduction : unit -> unit
+  val no_cmm_strength_reduction : unit -> unit
+  val cmm_interior_pointers : unit -> unit
+  val no_cmm_interior_pointers : unit -> unit
+  val cmm_invariant_strides : unit -> unit
+  val no_cmm_invariant_strides : unit -> unit
+  val cmm_carried_pointers : unit -> unit
+  val no_cmm_carried_pointers : unit -> unit
+  val cmm_licm : unit -> unit
+  val no_cmm_licm : unit -> unit
+  val cmm_counted_loops : unit -> unit
+  val no_cmm_counted_loops : unit -> unit
+  val cmm_unchecked_loops : unit -> unit
+  val no_cmm_unchecked_loops : unit -> unit
+  val dcounted_loops : unit -> unit
   val cfg_stack_checks : unit -> unit
   val no_cfg_stack_checks : unit -> unit
   val cfg_stack_checks_threshold : int -> unit
@@ -1560,6 +1653,21 @@ module Make_oxcaml_options (F : Oxcaml_options) = struct
       mk_no_x86_peephole_combine_add_rsp F.no_x86_peephole_combine_add_rsp;
       mk_no_x86_peephole_remove_redundant_test
         F.no_x86_peephole_remove_redundant_test;
+      mk_cmm_strength_reduction F.cmm_strength_reduction;
+      mk_no_cmm_strength_reduction F.no_cmm_strength_reduction;
+      mk_cmm_interior_pointers F.cmm_interior_pointers;
+      mk_no_cmm_interior_pointers F.no_cmm_interior_pointers;
+      mk_cmm_invariant_strides F.cmm_invariant_strides;
+      mk_no_cmm_invariant_strides F.no_cmm_invariant_strides;
+      mk_cmm_carried_pointers F.cmm_carried_pointers;
+      mk_no_cmm_carried_pointers F.no_cmm_carried_pointers;
+      mk_cmm_licm F.cmm_licm;
+      mk_no_cmm_licm F.no_cmm_licm;
+      mk_cmm_counted_loops F.cmm_counted_loops;
+      mk_no_cmm_counted_loops F.no_cmm_counted_loops;
+      mk_cmm_unchecked_loops F.cmm_unchecked_loops;
+      mk_no_cmm_unchecked_loops F.no_cmm_unchecked_loops;
+      mk_dcounted_loops F.dcounted_loops;
       mk_cfg_stack_checks F.cfg_stack_checks;
       mk_no_cfg_stack_checks F.no_cfg_stack_checks;
       mk_cfg_stack_checks_threshold F.cfg_stack_checks_threshold;
@@ -1919,6 +2027,21 @@ module Oxcaml_options_impl = struct
   let no_x86_peephole_remove_redundant_test =
     clear' Oxcaml_flags.x86_peephole_remove_redundant_test
 
+  let cmm_strength_reduction = set' Oxcaml_flags.cmm_strength_reduction
+  let no_cmm_strength_reduction = clear' Oxcaml_flags.cmm_strength_reduction
+  let cmm_interior_pointers = set' Oxcaml_flags.cmm_interior_pointers
+  let no_cmm_interior_pointers = clear' Oxcaml_flags.cmm_interior_pointers
+  let cmm_invariant_strides = set' Oxcaml_flags.cmm_invariant_strides
+  let no_cmm_invariant_strides = clear' Oxcaml_flags.cmm_invariant_strides
+  let cmm_carried_pointers = set' Oxcaml_flags.cmm_carried_pointers
+  let no_cmm_carried_pointers = clear' Oxcaml_flags.cmm_carried_pointers
+  let cmm_licm = set' Oxcaml_flags.cmm_licm
+  let no_cmm_licm = clear' Oxcaml_flags.cmm_licm
+  let cmm_counted_loops = set' Oxcaml_flags.cmm_counted_loops
+  let no_cmm_counted_loops = clear' Oxcaml_flags.cmm_counted_loops
+  let cmm_unchecked_loops = set' Oxcaml_flags.cmm_unchecked_loops
+  let no_cmm_unchecked_loops = clear' Oxcaml_flags.cmm_unchecked_loops
+  let dcounted_loops = set' Oxcaml_flags.dump_counted_loops
   let cfg_stack_checks = set' Oxcaml_flags.cfg_stack_checks
   let no_cfg_stack_checks = clear' Oxcaml_flags.cfg_stack_checks
 
@@ -2529,6 +2652,13 @@ module Extra_params = struct
         set_int' Oxcaml_flags.vectorize_max_block_size
     | "cfg-peephole-optimize" -> set' Oxcaml_flags.cfg_peephole_optimize
     | "x86-peephole-optimize" -> set' Oxcaml_flags.x86_peephole_optimize
+    | "cmm-strength-reduction" -> set' Oxcaml_flags.cmm_strength_reduction
+    | "cmm-interior-pointers" -> set' Oxcaml_flags.cmm_interior_pointers
+    | "cmm-invariant-strides" -> set' Oxcaml_flags.cmm_invariant_strides
+    | "cmm-carried-pointers" -> set' Oxcaml_flags.cmm_carried_pointers
+    | "cmm-licm" -> set' Oxcaml_flags.cmm_licm
+    | "cmm-counted-loops" -> set' Oxcaml_flags.cmm_counted_loops
+    | "cmm-unchecked-loops" -> set' Oxcaml_flags.cmm_unchecked_loops
     | "cfg-stack-checks" -> set' Oxcaml_flags.cfg_stack_checks
     | "cfg-eliminate-dead-trap-handlers" ->
         set' Oxcaml_flags.cfg_eliminate_dead_trap_handlers

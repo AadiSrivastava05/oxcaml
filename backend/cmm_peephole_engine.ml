@@ -326,6 +326,7 @@ module Cmm_comparator = struct
               params = params1;
               body = body1;
               is_cold = is_cold1;
+              is_bounded = is_bounded1;
               _
             }
           Cmm.
@@ -333,6 +334,7 @@ module Cmm_comparator = struct
               params = params2;
               body = body2;
               is_cold = is_cold2;
+              is_bounded = is_bounded2;
               _
             } =
         (* No alpha equivalence *)
@@ -345,6 +347,7 @@ module Cmm_comparator = struct
              params1 params2
         && equivalent body1 body2
         && Bool.equal is_cold1 is_cold2
+        && Bool.equal is_bounded1 is_bounded2
       in
       equal_ccatch_flag flag1 flag2
       && List.equal equal_handler handlers1 handlers2

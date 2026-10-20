@@ -51,6 +51,21 @@ module type Oxcaml_options = sig
   val no_x86_peephole_remove_redundant_extension : unit -> unit
   val no_x86_peephole_combine_add_rsp : unit -> unit
   val no_x86_peephole_remove_redundant_test : unit -> unit
+  val cmm_strength_reduction : unit -> unit
+  val no_cmm_strength_reduction : unit -> unit
+  val cmm_interior_pointers : unit -> unit
+  val no_cmm_interior_pointers : unit -> unit
+  val cmm_invariant_strides : unit -> unit
+  val no_cmm_invariant_strides : unit -> unit
+  val cmm_carried_pointers : unit -> unit
+  val no_cmm_carried_pointers : unit -> unit
+  val cmm_licm : unit -> unit
+  val no_cmm_licm : unit -> unit
+  val cmm_counted_loops : unit -> unit
+  val no_cmm_counted_loops : unit -> unit
+  val cmm_unchecked_loops : unit -> unit
+  val no_cmm_unchecked_loops : unit -> unit
+  val dcounted_loops : unit -> unit
   val cfg_stack_checks : unit -> unit
   val no_cfg_stack_checks : unit -> unit
   val cfg_stack_checks_threshold : int -> unit

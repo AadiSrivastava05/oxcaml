@@ -579,6 +579,8 @@ let compile_via_ssa ~ppf_dump ~funcnames (fd_cmm : Cmm.fundecl) :
 let compile_fundecl ~ppf_dump ~funcnames fd_cmm =
   Reg.clear_relocatable_regs ();
   fd_cmm
+  ++ Profile.record ~accumulate:true "cmm_strength_reduction"
+       Cmm_strength_reduction.fundecl
   ++ Profile.record ~accumulate:true "cmm_invariants" (cmm_invariants ppf_dump)
   ++ (if !Oxcaml_flags.use_ssa
       then compile_via_ssa ~ppf_dump ~funcnames

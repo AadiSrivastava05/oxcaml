@@ -374,6 +374,13 @@ let current_function_name = ref ""
 
 let current_function_is_check_enabled = ref false
 
+(* Poll attribute of the function being compiled. A function annotated
+   [@poll error] is rejected by [Cfg_polling] if it needs a safepoint at all,
+   so inside one there is no point at which the collector can run and no
+   derived pointer it could fail to update. Tracking it per function is what
+   lets a single kernel opt in without the whole unit giving up polling. *)
+let current_function_poll = ref Lambda.Default_poll
+
 module Effect = struct
   type t =
     | None

@@ -69,8 +69,10 @@ and instrument = function
        f_dbg, with_afl_logging f f_dbg, dbg)
   | Ccatch (Exn_handler, cases, body) ->
      let cases =
-       List.map (fun Cmm.{label = nfail; params = ids; body = e; dbg; is_cold} ->
-           Cmm.{label = nfail; params = ids; body = with_afl_logging e dbg; dbg; is_cold})
+       List.map (fun Cmm.{label = nfail; params = ids; body = e; dbg; is_cold;
+                          is_bounded} ->
+           Cmm.{label = nfail; params = ids; body = with_afl_logging e dbg; dbg;
+                is_cold; is_bounded})
          cases
      in
      Ccatch (Exn_handler, cases, instrument body)
@@ -93,8 +95,10 @@ and instrument = function
   | Csequence (e1, e2) -> Csequence (instrument e1, instrument e2)
   | Ccatch ((Normal | Recursive as flag), cases, body) ->
      let cases =
-       List.map (fun Cmm.{label = nfail; params = ids; body = e; dbg; is_cold} ->
-           Cmm.{label = nfail; params = ids; body = instrument e; dbg; is_cold})
+       List.map (fun Cmm.{label = nfail; params = ids; body = e; dbg; is_cold;
+                          is_bounded} ->
+           Cmm.{label = nfail; params = ids; body = instrument e; dbg; is_cold;
+                is_bounded})
          cases
      in
      Ccatch (flag, cases, instrument body)

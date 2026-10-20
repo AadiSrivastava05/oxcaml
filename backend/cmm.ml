@@ -671,7 +671,11 @@ type static_handler =
     params : (Backend_var.With_provenance.t * machtype) list;
     body : expression;
     dbg : Debuginfo.t;
-    is_cold : bool
+    is_cold : bool;
+    (* Set by [Cmm_strength_reduction] on a loop proved to terminate, which
+       polls on its exits instead of its back edge. [Cfg_polling] leaves its
+       back edge alone, which is what lets a derived pointer live across it. *)
+    is_bounded : bool
   }
 
 and expression =
@@ -759,7 +763,10 @@ type phrase =
   | Cdata of data_item list
 
 let ccatch (i, ids, e1, e2, dbg, is_cold) =
-  Ccatch (Normal, [{ label = i; params = ids; body = e2; dbg; is_cold }], e1)
+  Ccatch
+    ( Normal,
+      [{ label = i; params = ids; body = e2; dbg; is_cold; is_bounded = false }],
+      e1 )
 
 let ctrywith (body, lbl, id, extra_args, handler, dbg) =
   Ccatch
@@ -768,7 +775,8 @@ let ctrywith (body, lbl, id, extra_args, handler, dbg) =
           params = (id, typ_val) :: extra_args;
           body = handler;
           dbg;
-          is_cold = false
+          is_cold = false;
+          is_bounded = false
         } ],
       body )
 
@@ -824,8 +832,8 @@ let map_shallow_tail f = function
   | Cswitch (e, tbl, el, dbg') ->
     Cswitch (e, tbl, Array.map (fun (e, dbg) -> f e, dbg) el, dbg')
   | Ccatch (flag, handlers, body) ->
-    let map_h { label; params; body = handler; dbg; is_cold } =
-      { label; params; body = f handler; dbg; is_cold }
+    let map_h { label; params; body = handler; dbg; is_cold; is_bounded } =
+      { label; params; body = f handler; dbg; is_cold; is_bounded }
     in
     Ccatch (flag, List.map map_h handlers, f body)
   | (Cexit _ | Cop (Craise _, _, _) | Cinvalid _) as cmm -> cmm

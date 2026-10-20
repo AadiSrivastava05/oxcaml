@@ -325,7 +325,12 @@ let instr_cfg_with_layout :
   Cfg_edge.Set.fold
     (fun { Cfg_edge.src; dst } added_poll ->
       let needs_poll =
-        (not (Label.Tbl.find safe_map src))
+        (* A poll on a back edge bounds the time to reach a safepoint. A loop
+           [Cmm_strength_reduction] marked [is_bounded] is proved to terminate
+           and polls on its exits, so its back edge needs none, and a derived
+           pointer may live across it. *)
+        (not (Label.Set.mem dst cfg.Cfg.bounded_loop_headers))
+        && (not (Label.Tbl.find safe_map src))
         && exists_unsafe_path cfg ~safe_map ~from:dst ~to_:src
       in
       if needs_poll

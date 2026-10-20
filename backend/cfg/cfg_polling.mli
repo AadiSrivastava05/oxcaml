@@ -2,6 +2,9 @@
 
 (** Analyses related to the insertion of [Poll] operations. *)
 
+(** [caml_apply*] and [caml_send*]: functions that never get a poll. *)
+val function_is_assumed_to_never_poll : string -> bool
+
 val instrument_fundecl :
   future_funcnames:Misc.Stdlib.String.Set.t ->
   Cfg_with_layout.t ->
