@@ -901,6 +901,7 @@ val trywith :
 (** [handler id vars body is_cold] creates a static handler for exit number
     [id], binding variables [vars] in [body]. *)
 val handler :
+  ?is_bounded:bool ->
   dbg:Debuginfo.t ->
   Lambda.static_label ->
   (Backend_var.With_provenance.t * Cmm.machtype) list ->

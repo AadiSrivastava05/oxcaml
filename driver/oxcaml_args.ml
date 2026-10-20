@@ -202,6 +202,22 @@ let mk_no_cmm_licm f =
     Arg.Unit f,
     " Recompute loop-invariant integer expressions on every iteration" )
 
+let mk_cmm_counted_loops f =
+  ( "-cmm-counted-loops",
+    Arg.Unit f,
+    " Drop the back-edge poll of a GC-free loop that provably terminates, "
+    ^ "and poll once on its exits" )
+
+let mk_dcounted_loops f =
+  ( "-dcounted-loops",
+    Arg.Unit f,
+    " Print which loops -cmm-counted-loops makes poll-free, and why not" )
+
+let mk_no_cmm_counted_loops f =
+  ( "-no-cmm-counted-loops",
+    Arg.Unit f,
+    " Keep the back-edge poll of every loop" )
+
 let mk_cfg_stack_checks f =
   ( "-cfg-stack-checks",
     Arg.Unit f,
@@ -1397,6 +1413,9 @@ module type Oxcaml_options = sig
   val no_cmm_carried_pointers : unit -> unit
   val cmm_licm : unit -> unit
   val no_cmm_licm : unit -> unit
+  val cmm_counted_loops : unit -> unit
+  val no_cmm_counted_loops : unit -> unit
+  val dcounted_loops : unit -> unit
   val cfg_stack_checks : unit -> unit
   val no_cfg_stack_checks : unit -> unit
   val cfg_stack_checks_threshold : int -> unit
@@ -1603,6 +1622,9 @@ module Make_oxcaml_options (F : Oxcaml_options) = struct
       mk_no_cmm_carried_pointers F.no_cmm_carried_pointers;
       mk_cmm_licm F.cmm_licm;
       mk_no_cmm_licm F.no_cmm_licm;
+      mk_cmm_counted_loops F.cmm_counted_loops;
+      mk_no_cmm_counted_loops F.no_cmm_counted_loops;
+      mk_dcounted_loops F.dcounted_loops;
       mk_cfg_stack_checks F.cfg_stack_checks;
       mk_no_cfg_stack_checks F.no_cfg_stack_checks;
       mk_cfg_stack_checks_threshold F.cfg_stack_checks_threshold;
@@ -1964,6 +1986,9 @@ module Oxcaml_options_impl = struct
   let no_cmm_carried_pointers = clear' Oxcaml_flags.cmm_carried_pointers
   let cmm_licm = set' Oxcaml_flags.cmm_licm
   let no_cmm_licm = clear' Oxcaml_flags.cmm_licm
+  let cmm_counted_loops = set' Oxcaml_flags.cmm_counted_loops
+  let no_cmm_counted_loops = clear' Oxcaml_flags.cmm_counted_loops
+  let dcounted_loops = set' Oxcaml_flags.dump_counted_loops
   let cfg_stack_checks = set' Oxcaml_flags.cfg_stack_checks
   let no_cfg_stack_checks = clear' Oxcaml_flags.cfg_stack_checks
 
@@ -2569,6 +2594,7 @@ module Extra_params = struct
     | "cmm-invariant-strides" -> set' Oxcaml_flags.cmm_invariant_strides
     | "cmm-carried-pointers" -> set' Oxcaml_flags.cmm_carried_pointers
     | "cmm-licm" -> set' Oxcaml_flags.cmm_licm
+    | "cmm-counted-loops" -> set' Oxcaml_flags.cmm_counted_loops
     | "cfg-stack-checks" -> set' Oxcaml_flags.cfg_stack_checks
     | "cfg-eliminate-dead-trap-handlers" ->
         set' Oxcaml_flags.cfg_eliminate_dead_trap_handlers

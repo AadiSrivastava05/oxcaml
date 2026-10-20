@@ -554,7 +554,11 @@ type static_handler =
     params : (Backend_var.With_provenance.t * machtype) list;
     body : expression;
     dbg : Debuginfo.t;
-    is_cold : bool
+    is_cold : bool;
+    (* Set by [Cmm_strength_reduction] on a loop proved to terminate, which
+       polls on its exits instead of its back edge. [Cfg_polling] leaves its
+       back edge alone, which is what lets a derived pointer live across it. *)
+    is_bounded : bool
   }
 
 and expression =

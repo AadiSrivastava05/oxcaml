@@ -25,6 +25,12 @@ open! Int_replace_polymorphic_compare
 module DLL = Doubly_linked_list
 module Or_never_returns = Select_utils.Or_never_returns
 module SU = Select_utils
+
+(* Headers of counted loops in the function being translated.  The
+   handler labels are minted during selection but the [Cfg.t] only exists at
+   the end of it, so they are collected here and transferred in
+   [emit_fundecl]. *)
+let bounded_loop_headers = ref Label.Set.empty
 module V = Backend_var
 module VP = Backend_var.With_provenance
 open SU.Or_never_returns.Syntax
@@ -1248,7 +1254,8 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
       body =
     let handlers =
       List.map
-        (fun Cmm.{ label = nfail; params = ids; body = e2; dbg; is_cold } ->
+        (fun Cmm.{ label = nfail; params = ids; body = e2; dbg; is_cold;
+                   is_bounded } ->
           let rs =
             List.map
               (fun (id, typ) ->
@@ -1256,15 +1263,19 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
                 r)
               ids
           in
-          nfail, ids, rs, e2, dbg, is_cold)
+          nfail, ids, rs, e2, dbg, is_cold, is_bounded)
         handlers
     in
     let env, handlers_map =
       (* Since the handlers may be recursive, and called from the body, the same
          environment is used for translating both the handlers and the body. *)
       List.fold_left
-        (fun (env, map) (nfail, ids, rs, e2, dbg, is_cold) ->
+        (fun (env, map) (nfail, ids, rs, e2, dbg, is_cold, is_bounded) ->
           let label = Cmm.new_label () in
+          (* The handler's block is the loop header; recording it is what tells
+             [Cfg_polling] this loop's trip count is already bounded. *)
+          if is_bounded
+          then bounded_loop_headers := Label.Set.add label !bounded_loop_headers;
           let env, r = SU.env_add_static_exception nfail rs env label in
           ( env,
             Static_label.Map.add nfail
@@ -1396,6 +1407,7 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
         let carried_pointers_are_safe =
           (not Config.poll_insertion)
           || !Oxcaml_flags.disable_poll_insertion
+          || Label.Set.mem handler.label !bounded_loop_headers
           ||
           match !SU.current_function_poll with
           | Lambda.Error_poll -> true
@@ -1566,7 +1578,8 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
   and emit_tail_catch env sub_cfg (flag : Cmm.ccatch_flag) handlers e1 =
     let handlers =
       List.map
-        (fun Cmm.{ label = nfail; params = ids; body = e2; dbg; is_cold } ->
+        (fun Cmm.{ label = nfail; params = ids; body = e2; dbg; is_cold;
+                   is_bounded } ->
           let rs =
             List.map
               (fun (id, typ) ->
@@ -1574,13 +1587,17 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
                 r)
               ids
           in
-          nfail, ids, rs, e2, dbg, is_cold)
+          nfail, ids, rs, e2, dbg, is_cold, is_bounded)
         handlers
     in
     let env, handlers_map =
       List.fold_left
-        (fun (env, map) (nfail, ids, rs, e2, dbg, is_cold) ->
+        (fun (env, map) (nfail, ids, rs, e2, dbg, is_cold, is_bounded) ->
           let label = Cmm.new_label () in
+          (* The handler's block is the loop header; recording it is what tells
+             [Cfg_polling] this loop's trip count is already bounded. *)
+          if is_bounded
+          then bounded_loop_headers := Label.Set.add label !bounded_loop_headers;
           let env, r = SU.env_add_static_exception nfail rs env label in
           ( env,
             Static_label.Map.add nfail
@@ -1719,6 +1736,7 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
   let emit_fundecl ~future_funcnames f =
     SU.current_function_name := f.Cmm.fun_name.sym_name;
     SU.current_function_poll := f.Cmm.fun_poll;
+    bounded_loop_headers := Label.Set.empty;
     SU.current_function_is_check_enabled
       := Zero_alloc_checker.is_check_enabled f.Cmm.fun_codegen_options
            f.Cmm.fun_name.sym_name f.Cmm.fun_dbg;
@@ -1762,6 +1780,7 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
         ~fun_phantom_lets:(SU.phantom_lets_for_fundecl env)
         ~allowed_to_be_irreducible:false
     in
+    cfg.Cfg.bounded_loop_headers <- !bounded_loop_headers;
     let layout = DLL.make_empty () in
     let entry_block =
       Cfg.make_empty_block ~label:(Cfg.entry_label cfg)

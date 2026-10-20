@@ -448,7 +448,7 @@ let rec expr ppf = function
         fprintf ppf "@[<v 0>@[<2>(switch@ %a@ @]%t)@]" expr e1 print_cases)
   | Ccatch (flag, handlers, e1) ->
     let print_handler ppf
-        Cmm.{ label = i; params = ids; body = e2; dbg; is_cold } =
+        Cmm.{ label = i; params = ids; body = e2; dbg; is_cold; is_bounded } =
       with_location_mapping ~label:"Ccatch-handler" ~dbg ppf (fun () ->
           fprintf ppf "(%a%a)%s@ %a" Static_label.format i
             (fun ppf ids ->
@@ -456,7 +456,8 @@ let rec expr ppf = function
                 (fun (id, ty) -> fprintf ppf "@ %a: %a" VP.print id machtype ty)
                 ids)
             ids
-            (if is_cold then "(cold)" else "")
+            ((if is_cold then "(cold)" else "")
+            ^ if is_bounded then "(bounded)" else "")
             sequence e2)
     in
     let print_handlers ppf l = List.iter (print_handler ppf) l in

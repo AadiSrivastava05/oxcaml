@@ -256,9 +256,9 @@ expr:
           | _ -> Cifthenelse($3, debuginfo (), $4, debuginfo (),
                              (Cexit(Cmm.Lbl lbl0,[],[])),
                              debuginfo ()) in
-        Ccatch(Normal, [{ label = lbl0; params = []; body = Ctuple []; dbg = debuginfo (); is_cold =  false }],
+        Ccatch(Normal, [{ label = lbl0; params = []; body = Ctuple []; dbg = debuginfo (); is_cold =  false; is_bounded = false }],
           Ccatch(Recursive,
-            [{ label = lbl1; params = []; body = Csequence(body, Cexit(Cmm.Lbl lbl1, [], [])); dbg = debuginfo (); is_cold = false }],
+            [{ label = lbl1; params = []; body = Csequence(body, Cexit(Cmm.Lbl lbl1, [], [])); dbg = debuginfo (); is_cold = false; is_bounded = false }],
             Cexit(Cmm.Lbl lbl1, [], []))) }
   | LPAREN EXIT traps IDENT exprlist RPAREN
     { Cexit(Cmm.Lbl (find_label $4), List.rev $5, $3) }
@@ -284,12 +284,12 @@ expr:
                     params = [result', $3];
                     body = Cvar result;
                     dbg = debuginfo ();
-                    is_cold = false }],
+                    is_cold = false; is_bounded = false }],
                  Cexit (Cmm.Lbl after_pop_k,
                    [$4], (* original try body *)
                    [Pop exn_k]));
                dbg = debuginfo ();
-               is_cold = false }],
+               is_cold = false; is_bounded = false }],
             Cexit (Cmm.Lbl after_push_k, [], [Push exn_k])),
           exn_k,
           $6, (* exception parameter *)
@@ -470,9 +470,9 @@ catch_handlers:
 
 catch_handler:
   | sequence
-    { { label = Static_label.fail; params = []; body = $1; dbg = debuginfo (); is_cold = false; } }
+    { { label = Static_label.fail; params = []; body = $1; dbg = debuginfo (); is_cold = false; is_bounded = false; } }
   | LPAREN IDENT params RPAREN sequence
-    { { label = find_label $2; params = $3; body = $5; dbg = debuginfo (); is_cold = false; } }
+    { { label = find_label $2; params = $3; body = $5; dbg = debuginfo (); is_cold = false; is_bounded = false; } }
 
 location:
     /**/                        { None }

@@ -140,6 +140,10 @@ type t =
     mutable fun_prologue_required : bool;
         (** Whether the function needs a prologue, set by [Cfg_prologue]. *)
     fun_poll : Lambda.poll_attribute; (* Whether to insert polling points. *)
+    mutable bounded_loop_headers : Label.Set.t;
+        (** Headers of loops [Cmm_strength_reduction] proved to terminate;
+            they poll on their exits, so [Cfg_polling] leaves their back edges
+            alone and a derived pointer may live across one. *)
     next_instruction_id : InstructionId.sequence; (* Next instruction id. *)
     fun_ret_type : Cmm.machtype;
         (** Function return type. As in [fun_args], this value is not used when

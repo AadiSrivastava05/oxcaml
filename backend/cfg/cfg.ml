@@ -134,6 +134,7 @@ type t =
     mutable fun_frame_required : bool;
     mutable fun_prologue_required : bool;
     fun_poll : Lambda.poll_attribute;
+    mutable bounded_loop_headers : Label.Set.t;
     next_instruction_id : InstructionId.sequence;
     fun_ret_type : Cmm.machtype;
     fun_phantom_lets :
@@ -159,6 +160,7 @@ let create ~fun_name ~fun_args ~fun_codegen_options ~fun_dbg ~fun_contains_calls
     fun_frame_required = false;
     fun_prologue_required = false;
     fun_poll;
+    bounded_loop_headers = Label.Set.empty;
     next_instruction_id;
     fun_ret_type;
     fun_phantom_lets;

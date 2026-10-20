@@ -47,6 +47,12 @@ let cmm_carried_pointers = ref true     (* -[no-]cmm-carried-pointers *)
 
 let cmm_licm = ref true                 (* -[no-]cmm-licm *)
 
+(* Interior pointers with polling on. Off by default until the OxCaml
+   testsuite has been run with them. See cmm_strength_reduction.ml. *)
+let cmm_counted_loops = ref false       (* -[no-]cmm-counted-loops *)
+
+let dump_counted_loops = ref false      (* -dcounted-loops *)
+
 let cfg_stack_checks = ref true         (* -[no-]cfg-stack-check *)
 let cfg_stack_checks_threshold = ref 16384 (* -cfg-stack-threshold *)
 

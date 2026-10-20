@@ -507,8 +507,14 @@ let reduce ~duplicated ~int_vars ~label ~expr =
    division-by-zero path is a call. *)
 let operation_is_safepoint (op : operation) =
   match op with
-  | Capply _ | Cextcall _ | Calloc _ | Cpoll | Cprobe _ | Cbeginregion
-  | Cendregion | Catomic _ | Cdivi _ | Cmodi _ ->
+  (* An external call that cannot allocate records no frame and cannot run the
+     collector: a builtin is selected as an instruction in place of the call,
+     and any other is a plain C call with no GC interaction (the [noalloc]
+     contract). A SIMD loop is made of builtins; [exp] and friends are the
+     rest. *)
+  | Cextcall { alloc; _ } -> alloc
+  | Capply _ | Calloc _ | Cpoll | Cprobe _ | Cbeginregion | Cendregion
+  | Catomic _ | Cdivi _ | Cmodi _ ->
     true
   | Cload _ | Cstore _ | Caddi | Csubi | Cmuli | Cmulhi _ | Caddi128 | Csubi128
   | Cmuli64 _ | Cand | Cor | Cxor | Clsl | Clsr | Casr | Cbswap _ | Ccsel _
@@ -529,6 +535,25 @@ let rec is_gc_free expr =
     let safe = ref true in
     iter_subexpressions (fun sub -> if !safe then safe := is_gc_free sub) expr;
     !safe
+
+(* Does [expr] contain a loop that will still have a poll on its back edge?
+   [is_gc_free] does not ask, because without polling a back edge is not a
+   safepoint. With polling on, every loop keeps its poll unless it is a counted
+   loop, and a derived pointer carried by an enclosing loop would be live across
+   that poll, which [Emit] rejects as a bad GC root. *)
+let rec contains_polled_loop expr =
+  match expr with
+  | Ccatch (Recursive, handlers, _)
+    when List.exists
+           (fun (handler : static_handler) -> not handler.is_bounded)
+           handlers ->
+    true
+  | _ ->
+    let found = ref false in
+    iter_subexpressions
+      (fun sub -> if not !found then found := contains_polled_loop sub)
+      expr;
+    !found
 
 (* {2 Address expressions}
 
@@ -1224,6 +1249,258 @@ let reduce_invariant_strides ~duplicated ~int_vars ~relaxed ~carry_pointers
   let expr = Ccatch (flag, handlers, add_exit_args ~label ~extra body) in
   List.map (fun (def, var) -> var, def) !steps, expr
 
+(* {1 Pointers into rows of vectors}
+
+   A 128-bit access to an unboxed array, [Float64x2.Array.unsafe_get a ~idx],
+   reaches [Cmm] with its tagged index untagged inside the address:
+
+   {v (+a a (<< (>>s idx 1) 3)) v}
+
+   [idx] is an affine function of the loop counter like any other index, but the
+   arithmetic shift hides it from [index_of], so neither the interior pointers
+   nor the strength reduction see through it, and every access of a SIMD loop
+   pays its own untag and scale.
+
+   The shift is still exact where it matters. For integers [y] and [q],
+   [(y + 2q) >>s 1 = (y >>s 1) + q] whenever [y + 2q] does not overflow, and an
+   index that addresses memory has not. Writing the index as [y + 2q], with [y]
+   the part that varies plus the index's low bit, every access to one array at
+   the same [y] is one pointer
+
+   {v p = a + ((y >>s 1) << s) v}
+
+   plus the constant [q << s], which the addressing mode absorbs. Where every
+   step [n] of the counter makes [m * n] even, [y] steps by [m * n] and [p] by
+   the constant [(m * n / 2) << s], so [p] is carried as a loop parameter: built
+   from scratch on each edge that enters the loop, advanced by one addition on
+   each back edge. Like any carried derived pointer it is representable only
+   where no safepoint can be reached while it is live. *)
+
+let max_vector_pointers = 6
+
+type vector_key =
+  { vroot : V.t;
+    vinv : V.t option;
+    vcoefficient : int;
+    vmultiplier : int;
+    low_bit : int;
+    shift : int
+  }
+
+let same_vector_key a b =
+  V.same a.vroot b.vroot
+  && (match a.vinv, b.vinv with
+     | None, None -> true
+     | Some u, Some v -> V.same u v
+     | (None | Some _), _ -> false)
+  && a.vcoefficient = b.vcoefficient
+  && a.vmultiplier = b.vmultiplier
+  && a.low_bit = b.low_bit && a.shift = b.shift
+
+(* [(+a root (<< (>>s index 1) shift))] *)
+let vector_address (expr : expression) =
+  match expr with
+  | Cop
+      ( Cadda,
+        [ Cvar root;
+          Cop
+            ( Clsl,
+              [ Cop (Casr, [index; Cconst_int (1, _)], _);
+                Cconst_int (shift, _) ],
+              _ ) ],
+        _ )
+    when shift >= 0 && shift <= 3 ->
+    Some (root, index, shift)
+  | _ -> None
+
+(* Carry vector-row pointers for the handler named [label] of the [Ccatch
+   Recursive] node [expr]. Returns the new node. Raises [Not_applicable] if
+   nothing can be done, in which case the caller keeps the original node. *)
+let vector_pointers ~duplicated ~label ~expr =
+  let flag, handlers, body =
+    match expr with
+    | Ccatch (flag, handlers, body) -> flag, handlers, body
+    | _ -> raise Not_applicable
+  in
+  let handler =
+    match List.find_opt (is_label label) handlers with
+    | Some handler -> handler
+    | None -> raise Not_applicable
+  in
+  let roots =
+    body :: List.map (fun (handler : static_handler) -> handler.body) handlers
+  in
+  let exits = collect_exit_args ~label ~roots in
+  (match exits with [] -> raise Not_applicable | _ :: _ -> ());
+  let arity = List.length handler.params in
+  List.iter
+    (fun args ->
+      if List.compare_length_with args arity <> 0 then raise Not_applicable)
+    exits;
+  let dbg = handler.dbg in
+  let bound_inside = bound_variables V.Set.empty expr in
+  let invariant v = not (V.Set.mem v bound_inside) in
+  let defs = defs_of_body ~duplicated handler.body in
+  (* Each integer parameter is tried as the counter, as in
+     [reduce_invariant_strides]; the first that addresses a vector row wins. *)
+  let attempt index (param, machtype) =
+    if not (is_int_machtype machtype)
+    then None
+    else
+      let counter = VP.var param in
+      let affines = affines_of_body ~duplicated ~counter handler.body in
+      if V.Map.is_empty affines
+      then None
+      else
+        let classified =
+          List.map
+            (fun args -> classify_exit_arg ~affines (nth_arg args index))
+            exits
+        in
+        let steps =
+          List.filter_map
+            (function Some (Step n) -> Some n | Some (Fresh _) | None -> None)
+            classified
+        in
+        if
+          (not (List.for_all Option.is_some classified))
+          || List.compare_length_with steps 0 = 0
+        then None
+        else
+          let pointers = ref [] in
+          let pointer_for key =
+            match
+              List.find_opt (fun (key', _) -> same_vector_key key key') !pointers
+            with
+            | Some (_, var) -> Some var
+            | None ->
+              if List.compare_length_with !pointers max_vector_pointers >= 0
+              then None
+              else
+                let var = V.create_local "vp" in
+                pointers := (key, var) :: !pointers;
+                Some var
+          in
+          let rewrite_address dbg expr =
+            match vector_address expr with
+            | None -> expr
+            | Some (root, index, shift) -> (
+              if not (invariant root)
+              then expr
+              else
+                match index_of ~affines ~defs ~invariant ~fuel:24 index with
+                | None -> expr
+                | Some { invariant = inv; coefficient; multiplier; offset } -> (
+                  let exact =
+                    multiplier <> 0
+                    && List.for_all
+                         (fun n ->
+                           in_range (multiplier * n)
+                           && (multiplier * n) land 1 = 0)
+                         steps
+                  in
+                  let displacement = (offset asr 1) lsl shift in
+                  if not (exact && in_range displacement)
+                  then expr
+                  else
+                    let key =
+                      { vroot = root;
+                        vinv = inv;
+                        vcoefficient = coefficient;
+                        vmultiplier = multiplier;
+                        low_bit = offset land 1;
+                        shift
+                      }
+                    in
+                    match pointer_for key with
+                    | None -> expr
+                    | Some var ->
+                      if displacement = 0
+                      then Cvar var
+                      else
+                        Cop
+                          ( Cadda,
+                            [Cvar var; Cconst_int (displacement, dbg)],
+                            dbg )))
+          in
+          let rec loop expr =
+            match expr with
+            | Cop ((Cload _ as op), [address], dbg) ->
+              Cop (op, [rewrite_address dbg (loop address)], dbg)
+            | Cop ((Cstore _ as op), [address; value], dbg) ->
+              Cop (op, [rewrite_address dbg (loop address); loop value], dbg)
+            | _ -> map_subexpressions loop expr
+          in
+          let handler_body = loop handler.body in
+          match !pointers with
+          | [] -> None
+          | _ :: _ -> Some (index, affines, List.rev !pointers, handler_body)
+  in
+  let rec first index params =
+    match params with
+    | [] -> raise Not_applicable
+    | param :: params -> (
+      match attempt index param with
+      | Some found -> found
+      | None -> first (index + 1) params)
+  in
+  let index, affines, pointers, handler_body = first 0 handler.params in
+  (* [root + (((coefficient * inv + multiplier * start + low_bit) >>s 1) <<
+     shift)], the pointer for a counter equal to [start]. *)
+  let start_pointer key start =
+    let varying =
+      if key.vmultiplier = 1
+      then start
+      else Cop (Cmuli, [start; Cconst_int (key.vmultiplier, dbg)], dbg)
+    in
+    let with_inv =
+      match key.vinv with
+      | Some inv when key.vcoefficient <> 0 ->
+        Cop (Caddi, [scale_by key.vcoefficient (Cvar inv) dbg; varying], dbg)
+      | Some _ | None -> varying
+    in
+    let y =
+      if key.low_bit = 0
+      then with_inv
+      else Cop (Caddi, [with_inv; Cconst_int (key.low_bit, dbg)], dbg)
+    in
+    let untagged = Cop (Casr, [y; Cconst_int (1, dbg)], dbg) in
+    Cop (Cadda, [Cvar key.vroot; scale_by (1 lsl key.shift) untagged dbg], dbg)
+  in
+  let extra args =
+    match classify_exit_arg ~affines (nth_arg args index) with
+    | Some (Step n) ->
+      List.map
+        (fun (key, var) ->
+          let bytes = ((key.vmultiplier * n) asr 1) lsl key.shift in
+          if bytes = 0
+          then Cvar var
+          else Cop (Cadda, [Cvar var; Cconst_int (bytes, dbg)], dbg))
+        pointers
+    | Some (Fresh start) ->
+      List.map (fun (key, _) -> start_pointer key start) pointers
+    | None -> raise Not_applicable
+  in
+  let extra_params =
+    List.map (fun (_, var) -> VP.create var, typ_addr) pointers
+  in
+  let handlers =
+    List.map
+      (fun (handler : static_handler) ->
+        let handler =
+          if is_label label handler
+          then
+            { handler with
+              params = handler.params @ extra_params;
+              body = handler_body
+            }
+          else handler
+        in
+        { handler with body = add_exit_args ~label ~extra handler.body })
+      handlers
+  in
+  Ccatch (flag, handlers, add_exit_args ~label ~extra body)
+
 (* {1 Loop-invariant code motion}
 
    flambda2 has no loop-invariant code motion, so a computation that depends on
@@ -1356,6 +1633,622 @@ let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
      after it may refer to. *)
   | _ :: _ -> !hoisted, Ccatch (flag, handlers, body)
 
+(* {1 Counted loops}
+
+   The poll on a loop's back edge is there so that the loop cannot keep a
+   domain from a stop-the-world collection forever. Removing it changes nothing
+   the loop computes; it only matters if the loop never ends. So a loop that is
+   proved to end needs no back-edge poll: one poll on its exits gives the same
+   guarantee, and its body is then free to carry derived pointers.
+
+   The proof. The loop has one integer parameter [c] (the counter) that every
+   back edge passes as [c + n], for one constant [n], and one test [x R B] that
+   every back edge is reached through, where [x = m * c + k] (constants [m],
+   [k]) and [B] is a pure expression of variables bound outside the loop. All
+   arithmetic is on 64-bit words modulo 2^64, and [m * (c + n) + k = x + m * n]
+   holds exactly in that ring, so from one iteration to the next [x] changes by
+   exactly [d = m * n], whatever wraps. [B] is the same on every iteration.
+
+   - [x < B], [d > 0], given [B <= max - d + 1]: an iteration that continues has
+     [x < B], so [x + d <= B - 1 + d <= max] does not wrap; [x] strictly rises
+     while the loop continues, and the loop ends within [(B - x0) / d + 1]
+     iterations. [x <= B] needs [B <= max - d]; [x > B] and [x >= B] with
+     [d < 0] are the mirror images at [min].
+   - [x <> B], [|d|] a power of two, given [x0 <= B] and [(B - x0) land (d - 1)
+     = 0] (for [d > 0]; mirrored for [d < 0]): [x] stays a multiple of [d] below
+     [B], so [x + d <= B] does not wrap, and [x] reaches [B] exactly after
+     [(B - x0) / d] iterations. The low bits of [B - x0] are exact even when
+     the subtraction wraps, because [d] divides 2^64.
+   - [x = B]: [x] changes by [d <> 0] each iteration, so the test fails on the
+     second iteration at the latest.
+
+   Without the side conditions none of this holds: [i < n] stepping by 16 never
+   ends if [n] is within 15 of [max], and [i <> n] never ends if [n - i] is odd
+   and the step is 2. Where the side condition follows from the range of [B]
+   it is decided here; otherwise it is tested once on entry, and the loop is
+   compiled twice: the poll-free version, and an exact copy of the original,
+   polls included, for when the test fails.
+
+   Only the outermost counted loop of a nest gets the exit poll; one inside it
+   is covered by it, and a poll between two counted loops would stop the outer
+   one from carrying pointers across the inner. *)
+
+let counted_loops_enabled = ref false
+
+let found_counted = ref false
+
+(* The [Clet] definitions of the whole function, for [range]. *)
+let function_defs = ref V.Map.empty
+
+let word_max = Nativeint.max_int
+
+let word_min = Nativeint.min_int
+
+(* [a + b] on the host, or [None] if it overflows. *)
+let add_exact a b =
+  let sum = Nativeint.add a b in
+  if
+    Bool.equal (Nativeint.compare a 0n >= 0) (Nativeint.compare b 0n >= 0)
+    && not
+         (Bool.equal (Nativeint.compare sum 0n >= 0)
+            (Nativeint.compare a 0n >= 0))
+  then None
+  else Some sum
+
+let neg_exact a =
+  if Nativeint.equal a word_min then None else Some (Nativeint.neg a)
+
+(* Bounds [(lo, hi)] that the signed value of [expr] provably lies within, if
+   any are known. Only what is exact on 64-bit words is used. *)
+let rec range ~fuel (expr : expression) =
+  if fuel <= 0
+  then None
+  else
+    let recurse = range ~fuel:(fuel - 1) in
+    match expr with
+    | Cconst_int (n, _) -> Some (Nativeint.of_int n, Nativeint.of_int n)
+    | Cconst_natint (n, _) -> Some (n, n)
+    | Cvar v -> (
+      match V.Map.find_opt v !function_defs with
+      | Some def -> recurse def
+      | None -> None)
+    | Cop (Casr, [e; Cconst_int (k, _)], _) when k >= 1 && k <= 63 ->
+      let lo, hi =
+        match recurse e with Some r -> r | None -> word_min, word_max
+      in
+      Some (Nativeint.shift_right lo k, Nativeint.shift_right hi k)
+    | Cop (Clsr, [_; Cconst_int (k, _)], _) when k >= 1 && k <= 63 ->
+      Some (0n, Nativeint.shift_right_logical (-1n) k)
+    | Cop (Cand, [_; Cconst_int (c, _)], _) when c >= 0 ->
+      Some (0n, Nativeint.of_int c)
+    | Cop (Cand, [Cconst_int (c, _); _], _) when c >= 0 ->
+      Some (0n, Nativeint.of_int c)
+    | Cop (Caddi, [a; b], _) -> (
+      match recurse a, recurse b with
+      | Some (lo1, hi1), Some (lo2, hi2) -> (
+        match add_exact lo1 lo2, add_exact hi1 hi2 with
+        | Some lo, Some hi -> Some (lo, hi)
+        | (Some _ | None), (Some _ | None) -> None)
+      | (Some _ | None), (Some _ | None) -> None)
+    | Cop (Csubi, [a; b], _) -> (
+      match recurse a, recurse b with
+      | Some (lo1, hi1), Some (lo2, hi2) -> (
+        match neg_exact hi2, neg_exact lo2 with
+        | Some nhi2, Some nlo2 -> (
+          match add_exact lo1 nhi2, add_exact hi1 nlo2 with
+          | Some lo, Some hi -> Some (lo, hi)
+          | (Some _ | None), (Some _ | None) -> None)
+        | (Some _ | None), (Some _ | None) -> None)
+      | (Some _ | None), (Some _ | None) -> None)
+    | _ -> None
+
+(* The test that bounds a counted loop: [x continue_when bound] holds on every
+   iteration that takes a back edge, with [x = affine (counter)] changing by
+   [step] per iteration. *)
+type guard =
+  { index : int;
+    affine : affine;
+    continue_when : integer_comparison;
+    bound : expression;
+    step : int
+  }
+
+type precondition =
+  | Always
+  | Never
+  | Check of
+      { check : expression -> expression;
+            (** Given the counter's value on entry, an expression that is
+                non-zero iff the loop is proved to end. *)
+        uses_start : bool
+            (** Whether [check] reads that value; one that does not depends only
+                on values fixed for the whole loop. *)
+      }
+
+let is_power_of_two n = n > 0 && n land (n - 1) = 0
+
+let precondition ~dbg guard =
+  let d = guard.step in
+  (* [B <= max] and [B >= min] hold of every word. *)
+  let at_most limit =
+    if Nativeint.equal limit word_max
+    then Always
+    else
+      match range ~fuel:16 guard.bound with
+      | Some (_, hi) when Nativeint.compare hi limit <= 0 -> Always
+      | Some (lo, _) when Nativeint.compare lo limit > 0 -> Never
+      | Some _ | None ->
+        Check
+          { check =
+              (fun _ ->
+                Cop (Ccmpi Cle, [guard.bound; Cconst_natint (limit, dbg)], dbg));
+            uses_start = false
+          }
+  in
+  let at_least limit =
+    if Nativeint.equal limit word_min
+    then Always
+    else
+      match range ~fuel:16 guard.bound with
+      | Some (lo, _) when Nativeint.compare lo limit >= 0 -> Always
+      | Some (_, hi) when Nativeint.compare hi limit < 0 -> Never
+      | Some _ | None ->
+        Check
+          { check =
+              (fun _ ->
+                Cop (Ccmpi Cge, [guard.bound; Cconst_natint (limit, dbg)], dbg));
+            uses_start = false
+          }
+  in
+  let dn = Nativeint.of_int d in
+  match guard.continue_when with
+  | Ceq -> Always
+  | Clt when d > 0 -> at_most (Nativeint.add (Nativeint.sub word_max dn) 1n)
+  | Cle when d > 0 -> at_most (Nativeint.sub word_max dn)
+  | Cgt when d < 0 -> at_least (Nativeint.sub (Nativeint.sub word_min dn) 1n)
+  | Cge when d < 0 -> at_least (Nativeint.sub word_min dn)
+  | Cne when is_power_of_two (abs d) ->
+    Check
+      { uses_start = true;
+        check =
+      (fun start ->
+        let x0 = apply_affine guard.affine start dbg in
+        let before, distance =
+          if d > 0
+          then
+            ( Cop (Ccmpi Cle, [x0; guard.bound], dbg),
+              Cop (Csubi, [guard.bound; x0], dbg) )
+          else
+            ( Cop (Ccmpi Cge, [x0; guard.bound], dbg),
+              Cop (Csubi, [x0; guard.bound], dbg) )
+        in
+        if abs d = 1
+        then before
+        else
+          Cop
+            ( Cand,
+              [ before;
+                Cop
+                  ( Ccmpi Ceq,
+                    [ Cop (Cand, [distance; Cconst_int (abs d - 1, dbg)], dbg);
+                      Cconst_int (0, dbg) ],
+                    dbg ) ],
+              dbg ))
+      }
+  | Clt | Cle | Cgt | Cge | Cne | Cult | Cugt | Cule | Cuge -> Never
+
+let same_guard ((a1 : affine), c1, b1) ((a2 : affine), c2, b2) =
+  a1.multiplier = a2.multiplier
+  && a1.offset = a2.offset
+  && Stdlib.( = ) c1 c2
+  && same_expression b1 b2
+
+(* The guard of the loop [handler] of [expr], if it is a counted loop. *)
+let counted_guard ~duplicated ~int_vars ~expr (handler : static_handler) =
+  let label = handler.label in
+  let bound_inside = bound_variables V.Set.empty expr in
+  let invariant v = not (V.Set.mem v bound_inside) in
+  let back_edges =
+    try collect_exit_args ~label ~roots:[handler.body]
+    with Not_applicable -> []
+  in
+  let attempt index (param, machtype) =
+    if
+      (not (is_int_machtype machtype))
+      || List.compare_length_with back_edges 0 = 0
+    then None
+    else
+      let counter = VP.var param in
+      let affines = affines_of_body ~duplicated ~counter handler.body in
+      let step_of args =
+        match List.nth_opt args index with
+        | None -> None
+        | Some arg -> (
+          match classify_exit_arg ~affines arg with
+          | Some (Step n) when n <> 0 -> Some n
+          | Some (Step _ | Fresh _) | None -> None)
+      in
+      match List.map step_of back_edges with
+      | Some n :: rest
+        when List.for_all
+               (function Some n' -> n' = n | None -> false)
+               rest ->
+        let bound e = invariant_int ~invariant ~int_vars ~relaxed:true e in
+        (* [cond] as [x cmp bound] with [x] the affine side, if it is one. *)
+        let classify cond =
+          match cond with
+          | Cop (Ccmpi ((Ceq | Cne | Clt | Cgt | Cle | Cge) as cmp), [a; b], _)
+            -> (
+            match affine_of ~affines a, affine_of ~affines b with
+            | Some affine, None when affine.multiplier <> 0 && bound b ->
+              Some (affine, cmp, b)
+            | None, Some affine when affine.multiplier <> 0 && bound a ->
+              Some (affine, swap_integer_comparison cmp, a)
+            | (Some _ | None), (Some _ | None) -> None)
+          | _ -> None
+        in
+        (* For each back edge, the tests it is reached through, each as the
+           relation that holds when the back edge is taken. *)
+        let per_edge = ref [] in
+        let rec walk active expr =
+          match expr with
+          | Cexit (Lbl l, args, _) when Static_label.equal l label ->
+            per_edge := active :: !per_edge;
+            List.iter (walk active) args
+          | Cifthenelse (cond, _, if_true, _, if_false, _) -> (
+            walk active cond;
+            match classify cond with
+            | Some (affine, cmp, b) ->
+              walk ((affine, cmp, b) :: active) if_true;
+              walk ((affine, negate_integer_comparison cmp, b) :: active) if_false
+            | None ->
+              walk active if_true;
+              walk active if_false)
+          | _ -> iter_subexpressions (walk active) expr
+        in
+        walk [] handler.body;
+        let dominating =
+          match !per_edge with
+          | [] -> []
+          | first :: others ->
+            List.filter
+              (fun g -> List.for_all (List.exists (same_guard g)) others)
+              first
+        in
+        let proofs =
+          List.filter_map
+            (fun ((affine : affine), continue_when, b) ->
+              let d = affine.multiplier * n in
+              if not (in_range d)
+              then None
+              else
+                let guard =
+                  { index; affine; continue_when; bound = b; step = d }
+                in
+                match precondition ~dbg:handler.dbg guard with
+                | Never -> None
+                | (Always | Check _) as pre -> Some (guard, pre))
+            dominating
+        in
+        (* A guard that needs no check beats one that does. *)
+        (match
+           List.find_opt
+             (fun (_, pre) ->
+               match pre with Always -> true | Never | Check _ -> false)
+             proofs
+         with
+        | Some proof -> Some proof
+        | None -> ( match proofs with proof :: _ -> Some proof | [] -> None))
+      | _ -> None
+  in
+  let rec first index params =
+    match params with
+    | [] -> None
+    | param :: params -> (
+      match attempt index param with
+      | Some found -> Some found
+      | None -> first (index + 1) params)
+  in
+  first 0 handler.params
+
+let rec handler_labels acc expr =
+  let acc =
+    match expr with
+    | Ccatch (_, handlers, _) ->
+      List.map (fun (handler : static_handler) -> handler.label) handlers @ acc
+    | _ -> acc
+  in
+  let acc = ref acc in
+  iter_subexpressions (fun sub -> acc := handler_labels !acc sub) expr;
+  !acc
+
+(* [Cexit] arguments are evaluated right to left; binding them to temporaries
+   has to keep that order. *)
+let bind_right_to_left temps args body =
+  List.fold_left2
+    (fun body temp arg -> Clet (VP.create temp, arg, body))
+    body temps args
+
+(* Poll on every way out of the counted loop [node]: each exit from its
+   poll-free handler to a label bound outside [node], and falling out of it.
+   Exit arguments are evaluated before the poll, so nothing the loop derived is
+   live across it. The fallback copy polls on its own back edge. *)
+let poll_on_exits ~dbg node =
+  match node with
+  | Ccatch (flag, handlers, body) ->
+    let inside = handler_labels [] node in
+    let leaves (target : exit_label) =
+      match target with
+      | Return_lbl -> true
+      | Lbl l -> not (List.exists (Static_label.equal l) inside)
+    in
+    let rec loop expr =
+      match expr with
+      | Cexit (target, args, traps) when leaves target ->
+        let temps = List.map (fun _ -> V.create_local "exit_arg") args in
+        bind_right_to_left temps args
+          (Csequence
+             ( Cop (Cpoll, [], dbg),
+               Cexit (target, List.map (fun temp -> Cvar temp) temps, traps) ))
+      | _ -> map_subexpressions loop expr
+    in
+    let handlers =
+      List.map
+        (fun (handler : static_handler) ->
+          if handler.is_bounded
+          then { handler with body = loop handler.body }
+          else handler)
+        handlers
+    in
+    let result = V.create_local "loop_result" in
+    Clet
+      ( VP.create result,
+        Ccatch (flag, handlers, body),
+        Csequence (Cop (Cpoll, [], dbg), Cvar result) )
+  | _ -> node
+
+(* Add the exit polls of the counted loops that need them. A counted loop
+   inside a loop that keeps its poll needs none: [Cfg_polling] puts a poll on
+   that loop's back edge wherever a path through it reaches no safepoint, which
+   a path through a counted loop now is, so the time to a poll stays bounded
+   by one of its iterations. A counted loop inside another counted loop is
+   covered by the outer one's exit poll. *)
+let rec add_exit_polls ~in_polled_loop expr =
+  match expr with
+  | Ccatch (Recursive, handlers, body) ->
+    if List.exists (fun (handler : static_handler) -> handler.is_bounded) handlers
+    then
+      if in_polled_loop
+      then expr
+      else poll_on_exits ~dbg:(List.hd handlers).dbg expr
+    else
+      Ccatch
+        ( Recursive,
+          List.map
+            (fun (handler : static_handler) ->
+              { handler with
+                body = add_exit_polls ~in_polled_loop:true handler.body
+              })
+            handlers,
+          add_exit_polls ~in_polled_loop body )
+  | _ -> map_subexpressions (add_exit_polls ~in_polled_loop) expr
+
+(* A copy of [expr] in which every label and variable bound inside it is
+   renamed, so that it can stand next to the original. Debugger-only bindings
+   are dropped from the copy. *)
+let fresh_copy expr =
+  let renamed =
+    List.map (fun l -> l, Lambda.next_raise_count ()) (handler_labels [] expr)
+  in
+  let relabel l =
+    match List.find_opt (fun (l', _) -> Static_label.equal l l') renamed with
+    | Some (_, l') -> l'
+    | None -> l
+  in
+  let fresh env v =
+    let v' = V.create_local (V.name (VP.var v)) in
+    VP.create v', V.Map.add (VP.var v) v' env
+  in
+  let rec copy env expr =
+    match expr with
+    | Cvar v -> (
+      match V.Map.find_opt v env with Some v' -> Cvar v' | None -> expr)
+    | Clet (v, def, body) ->
+      let def = copy env def in
+      let v, env = fresh env v in
+      Clet (v, def, copy env body)
+    | Cphantom_let (_, _, body) | Cname_for_debugger (_, body) -> copy env body
+    | Ccatch (flag, handlers, body) ->
+      let handlers =
+        List.map
+          (fun (handler : static_handler) ->
+            let params, env =
+              List.fold_right
+                (fun (param, machtype) (params, env) ->
+                  let param, env = fresh env param in
+                  (param, machtype) :: params, env)
+                handler.params ([], env)
+            in
+            { handler with
+              label = relabel handler.label;
+              params;
+              body = copy env handler.body
+            })
+          handlers
+      in
+      Ccatch (flag, handlers, copy env body)
+    | Cexit (target, args, traps) ->
+      let target =
+        match target with Lbl l -> Lbl (relabel l) | Return_lbl -> Return_lbl
+      in
+      let traps =
+        List.map
+          (function Push l -> Push (relabel l) | Pop l -> Pop (relabel l))
+          traps
+      in
+      Cexit (target, List.map (copy env) args, traps)
+    | _ -> map_subexpressions (copy env) expr
+  in
+  copy V.Map.empty expr
+
+(* [node] holds the poll-free loop [original.label] that the pipeline produced
+   from [original]. Add an exact copy of [original], polls included, and enter
+   the poll-free loop only where [pre] holds of the counter's entry value. *)
+let add_slow_path ~(original : static_handler) ~index ~pre node =
+  let label = original.label in
+  let slow =
+    match
+      fresh_copy (Ccatch (Recursive, [original], Cexit (Lbl label, [], [])))
+    with
+    | Ccatch (_, [slow], _) -> { slow with is_bounded = false }
+    | _ -> Misc.fatal_error "Cmm_strength_reduction.add_slow_path"
+  in
+  let arity = List.length original.params in
+  let dbg = original.dbg in
+  let rec branch expr =
+    match expr with
+    | Cexit (Lbl l, args, traps) when Static_label.equal l label ->
+      let given = List.filteri (fun i _ -> i < arity) args in
+      let extra = List.filteri (fun i _ -> i >= arity) args in
+      let temps = List.map (fun _ -> V.create_local "entry_arg") given in
+      let vars = List.map (fun temp -> Cvar temp) temps in
+      bind_right_to_left temps given
+        (Cifthenelse
+           ( pre (List.nth vars index),
+             dbg,
+             Cexit (Lbl label, vars @ extra, traps),
+             dbg,
+             Cexit (Lbl slow.label, vars, traps),
+             dbg ))
+    | _ -> map_subexpressions branch expr
+  in
+  let found = ref None in
+  let rec find expr =
+    match expr with
+    | Ccatch (Recursive, [fast], body) when Static_label.equal fast.label label
+      ->
+      found := Some expr;
+      Ccatch (Recursive, [fast; slow], branch body)
+    | _ -> map_subexpressions find expr
+  in
+  let versioned = find node in
+  match !found with
+  | Some fast_node -> versioned, fast_node
+  | None -> Misc.fatal_error "Cmm_strength_reduction.add_slow_path: no loop"
+
+(* {2 Nests}
+
+   An inner loop that carries an entry check has a fallback copy that polls, so
+   the loop around it could not be counted, and a nest such as attention --
+   positions, then a dot product per position -- polled once per position. A
+   check of [B] alone ([uses_start = false]) has the same value wherever it is
+   evaluated inside a loop that binds none of [B]'s variables. So when the
+   outer loop is counted, the inner check is moved to the outer loop's entry:
+   inside the outer loop's poll-free version the inner loop runs poll-free
+   with no check, and the outer loop's fallback copy keeps the inner loop as it
+   was. This repeats outwards, so the poll-free region is the whole nest. *)
+
+(* Loops with an entry check, by the label of their poll-free handler: the loop
+   without its fallback copy, and the check if it does not read the counter's
+   entry value. *)
+let versioned_loops :
+    (Static_label.t * (expression * expression option)) list ref =
+  ref []
+
+(* [expr] in terms of variables bound outside a loop: every variable in
+   [inside] is replaced by its definition. Only pure, total integer
+   operations are allowed, so the result is the value [expr] has anywhere in
+   the loop. [None] if that is not possible. *)
+let lift_out ~inside expr =
+  let rec go ~fuel expr =
+    if fuel <= 0
+    then None
+    else
+      match expr with
+      | Cconst_int _ | Cconst_natint _ -> Some expr
+      | Cvar v -> (
+        if not (V.Set.mem v inside)
+        then Some expr
+        else
+          match V.Map.find_opt v !function_defs with
+          | Some def -> go ~fuel:(fuel - 1) def
+          | None -> None)
+      | Cop
+          ( (( Caddi | Csubi | Cmuli | Cand | Cor | Cxor | Clsl | Clsr | Casr
+             | Ccmpi _ ) as op),
+            args,
+            dbg ) ->
+        let args = List.map (go ~fuel:(fuel - 1)) args in
+        if List.for_all Option.is_some args
+        then Some (Cop (op, List.filter_map Fun.id args, dbg))
+        else None
+      | _ -> None
+  in
+  go ~fuel:32 expr
+
+let versioned_entry handlers =
+  List.find_map
+    (fun (handler : static_handler) ->
+      List.find_map
+        (fun (label, entry) ->
+          if Static_label.equal label handler.label then Some entry else None)
+        !versioned_loops)
+    handlers
+
+(* [body] with every inner loop that carries an entry check replaced by its
+   poll-free version, and those checks lifted out of the loop whose variables
+   are [inside]; [None] if one of them cannot be lifted. *)
+let specialize ~inside body =
+  let checks = ref [] and ok = ref true in
+  let rec go expr =
+    match expr with
+    | Ccatch (Recursive, handlers, _) -> (
+      match versioned_entry handlers with
+      | Some (fast_node, Some check) -> (
+        match lift_out ~inside check with
+        | Some lifted ->
+          checks := lifted :: !checks;
+          fast_node
+        | None ->
+          ok := false;
+          expr)
+      | Some (_, None) ->
+        ok := false;
+        expr
+      | None -> map_subexpressions go expr)
+    | _ -> map_subexpressions go expr
+  in
+  let body = go body in
+  if !ok then Some (body, List.rev !checks) else None
+
+let conjunction ~dbg checks =
+  match checks with
+  | [] -> Cconst_int (1, dbg)
+  | first :: rest ->
+    List.fold_left (fun acc c -> Cop (Cand, [acc; c], dbg)) first rest
+
+(* The loop's own precondition, with the inner checks lifted into it. *)
+let with_lifted ~dbg pre lifted =
+  match pre, lifted with
+  | (Always | Never), [] -> pre
+  | Always, _ :: _ ->
+    Check { check = (fun _ -> conjunction ~dbg lifted); uses_start = false }
+  | Check { check; uses_start }, _ ->
+    Check
+      { check = (fun start -> conjunction ~dbg (check start :: lifted));
+        uses_start
+      }
+  | Never, _ :: _ -> Never
+
+(* -dcounted-loops *)
+let current_function = ref ""
+
+let report ~dbg decision =
+  if !Oxcaml_flags.dump_counted_loops
+  then
+    Format.eprintf "@[<h>counted-loops %s %a: %s@]@." !current_function
+      Debuginfo.print_compact dbg decision
+
 (* {1 Driver} *)
 
 let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
@@ -1390,69 +2283,164 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
       (* Reading a variable once before the loop instead of once per iteration
          is the same computation only where nothing can move it in between, and
          a pointer may only be derived where nothing can move it at all. *)
-      let relaxed = form_interior_pointers && is_gc_free expr in
-      (* Invariants first: what leaves the loop here is bound outside it, so the
-         passes below may treat it as loop-invariant. *)
-      let hoisted, expr =
-        if not (licm && relaxed)
-        then [], expr
-        else
-          match
-            hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr
-          with
-          | hoisted, expr -> hoisted, expr
-          | exception Not_applicable -> [], expr
+      let gc_free = is_gc_free expr in
+      let pipeline ?(gc_free = gc_free) ~form_interior_pointers ~carry_pointers
+          ~handlers expr =
+        let relaxed = form_interior_pointers && gc_free in
+        (* Invariants first: what leaves the loop here is bound outside it, so the
+           passes below may treat it as loop-invariant. *)
+        let hoisted, expr =
+          if not (licm && relaxed)
+          then [], expr
+          else
+            match
+              hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr
+            with
+            | hoisted, expr -> hoisted, expr
+            | exception Not_applicable -> [], expr
+        in
+        (* Interior pointers next. Where they fire they subsume the strength
+           reduction: a fixed base plus the loop counter is strictly better than a
+           running index, and the sum [b + i] the strength reduction looks for is
+           gone from the addresses it rewrote, so the two cannot both fire on one
+           access and leave the loop carrying both. *)
+        let bindings, expr =
+          if not form_interior_pointers
+          then [], expr
+          else
+            List.fold_left
+              (fun (bindings, expr) (handler : static_handler) ->
+                match
+                  interior_pointers ~duplicated ~label:handler.label ~expr
+                with
+                | new_bindings, expr -> new_bindings @ bindings, expr
+                | exception Not_applicable -> bindings, expr)
+              ([], expr) handlers
+        in
+        (* Vector rows before [reduce], which would otherwise carry the index
+           sums these addresses are built from and hide their counter. *)
+        let expr =
+          if not (carry_pointers && relaxed)
+          then expr
+          else
+            List.fold_left
+              (fun expr (handler : static_handler) ->
+                match vector_pointers ~duplicated ~label:handler.label ~expr with
+                | expr -> expr
+                | exception Not_applicable -> expr)
+              expr handlers
+        in
+        let expr =
+          if not strength_reduction
+          then expr
+          else
+            List.fold_left
+              (fun expr (handler : static_handler) ->
+                match reduce ~duplicated ~int_vars ~label:handler.label ~expr with
+                | expr -> expr
+                | exception Not_applicable -> expr)
+              expr handlers
+        in
+        (* The row loop above an interior pointer steps it by a multiple of the
+           row length, which is a loop-invariant value rather than a constant, so
+           [reduce] cannot carry it and every row rebuilds the pointer from the
+           row index. *)
+        let bindings, expr =
+          if not (strength_reduction && invariant_strides && relaxed)
+          then bindings, expr
+          else
+            List.fold_left
+              (fun (bindings, expr) (handler : static_handler) ->
+                match
+                  reduce_invariant_strides ~duplicated ~int_vars ~relaxed
+                    ~carry_pointers ~label:handler.label ~expr
+                with
+                | new_bindings, expr -> new_bindings @ bindings, expr
+                | exception Not_applicable -> bindings, expr)
+              (bindings, expr) handlers
+        in
+        List.fold_left
+          (fun expr (var, def) -> Clet (VP.create var, def, expr))
+          expr (bindings @ hoisted)
       in
-      (* Interior pointers next. Where they fire they subsume the strength
-         reduction: a fixed base plus the loop counter is strictly better than a
-         running index, and the sum [b + i] the strength reduction looks for is
-         gone from the addresses it rewrote, so the two cannot both fire on one
-         access and leave the loop carrying both. *)
-      let bindings, expr =
-        if not form_interior_pointers
-        then [], expr
+      (* Where a safepoint is possible the pointer passes decline, because a
+         derived pointer may not be live across one. A counted loop has no
+         back-edge poll -- it polls on its exits instead -- so inside it the
+         passes run as they would on a unit compiled without polling. *)
+      let counted =
+        if not (!counted_loops_enabled && not form_interior_pointers)
+        then None
         else
-          List.fold_left
-            (fun (bindings, expr) (handler : static_handler) ->
-              match
-                interior_pointers ~duplicated ~label:handler.label ~expr
-              with
-              | new_bindings, expr -> new_bindings @ bindings, expr
-              | exception Not_applicable -> bindings, expr)
-            ([], expr) handlers
+          match expr, handlers with
+          | Ccatch (_, _, entry), [original] -> (
+            let dbg = original.dbg in
+            let decline reason =
+              report ~dbg ("not counted: " ^ reason);
+              None
+            in
+            match
+              specialize ~inside:(bound_variables V.Set.empty expr)
+                original.body
+            with
+            | None -> decline "an inner loop's entry check cannot be lifted"
+            | Some (body, lifted) -> (
+              let handler = { original with body } in
+              let node = Ccatch (Recursive, [handler], entry) in
+              if not (is_gc_free node)
+              then decline "a GC point inside"
+              else if contains_polled_loop body || contains_polled_loop entry
+              then decline "a loop inside that keeps its poll"
+              else
+                match counted_guard ~duplicated ~int_vars ~expr:node handler with
+                | None -> decline "no counter with a dominating guard"
+                | Some (guard, pre) ->
+                  let pre = with_lifted ~dbg pre lifted in
+                  report ~dbg
+                    (Printf.sprintf "counted, %s%s"
+                       (match pre with
+                       | Always | Never -> "no entry check"
+                       | Check _ -> "entry check")
+                       (match lifted with
+                       | [] -> ""
+                       | _ :: _ ->
+                         Printf.sprintf " (%d inner check(s) lifted)"
+                           (List.length lifted)));
+                  Some (original, handler, node, guard, pre)))
+          | _, _ :: _ :: _ ->
+            report
+              ~dbg:(List.hd handlers).dbg
+              "not counted: several handlers";
+            None
+          | _, _ -> None
       in
-      let expr =
-        if not strength_reduction
-        then expr
-        else
-          List.fold_left
-            (fun expr (handler : static_handler) ->
-              match reduce ~duplicated ~int_vars ~label:handler.label ~expr with
-              | expr -> expr
-              | exception Not_applicable -> expr)
-            expr handlers
-      in
-      (* The row loop above an interior pointer steps it by a multiple of the
-         row length, which is a loop-invariant value rather than a constant, so
-         [reduce] cannot carry it and every row rebuilds the pointer from the
-         row index. *)
-      let bindings, expr =
-        if not (strength_reduction && invariant_strides && relaxed)
-        then bindings, expr
-        else
-          List.fold_left
-            (fun (bindings, expr) (handler : static_handler) ->
-              match
-                reduce_invariant_strides ~duplicated ~int_vars ~relaxed
-                  ~carry_pointers ~label:handler.label ~expr
-              with
-              | new_bindings, expr -> new_bindings @ bindings, expr
-              | exception Not_applicable -> bindings, expr)
-            (bindings, expr) handlers
-      in
-      List.fold_left
-        (fun expr (var, def) -> Clet (VP.create var, def, expr))
-        expr (bindings @ hoisted))
+      match counted with
+      | None -> pipeline ~form_interior_pointers ~carry_pointers ~handlers expr
+      | Some (original, handler, node, guard, pre) -> (
+        found_counted := true;
+        let fast = { handler with is_bounded = true } in
+        let expr =
+          match node with
+          | Ccatch (flag, _, entry) -> Ccatch (flag, [fast], entry)
+          | _ -> node
+        in
+        let expr =
+          pipeline ~gc_free:true ~form_interior_pointers:true
+            ~carry_pointers:true ~handlers:[fast] expr
+        in
+        match pre with
+        | Always | Never -> expr
+        | Check { check; uses_start } ->
+          let versioned, fast_node =
+            add_slow_path ~original ~index:guard.index ~pre:check expr
+          in
+          versioned_loops
+            := ( fast.label,
+                 ( fast_node,
+                   if uses_start
+                   then None
+                   else Some (check (Cconst_int (0, original.dbg))) ) )
+               :: !versioned_loops;
+          versioned))
   | _ -> map_subexpressions (rewrite int_vars) expr
 
 (* Interior pointers are only correct where no collection can happen, and a loop
@@ -1484,16 +2472,31 @@ let fundecl (fundecl : fundecl) =
   let carry_pointers =
     !Oxcaml_flags.cmm_carried_pointers && polls_are_impossible fundecl
   in
-  if not (strength_reduction || form_interior_pointers || licm)
+  (* The proofs above are about 64-bit words, computed with a 64-bit host. *)
+  counted_loops_enabled
+    := !Oxcaml_flags.cmm_counted_loops
+       && (not (polls_are_impossible fundecl))
+       && Arch.size_int = 8 && Nativeint.size = 64;
+  found_counted := false;
+  versioned_loops := [];
+  current_function := fundecl.fun_name.sym_name;
+  if
+    not
+      (strength_reduction || form_interior_pointers || licm
+     || !counted_loops_enabled)
   then fundecl
   else
     let params = List.map (fun (param, _) -> VP.var param) fundecl.fun_args in
     let duplicated = duplicate_binders ~params fundecl.fun_body in
     let int_vars = add_int_params ~duplicated V.Set.empty fundecl.fun_args in
     let counts = occurrence_counts fundecl.fun_body in
-    { fundecl with
-      fun_body =
-        rewrite ~duplicated ~strength_reduction ~form_interior_pointers
-          ~invariant_strides ~carry_pointers ~licm ~counts int_vars
-          fundecl.fun_body
-    }
+    function_defs := defs_of_body ~duplicated fundecl.fun_body;
+    let body =
+      rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+        ~invariant_strides ~carry_pointers ~licm ~counts int_vars
+        fundecl.fun_body
+    in
+    let body =
+      if !found_counted then add_exit_polls ~in_polled_loop:false body else body
+    in
+    { fundecl with fun_body = body }

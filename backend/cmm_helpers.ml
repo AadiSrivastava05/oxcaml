@@ -3853,7 +3853,8 @@ let cache_public_method meths tag cache dbg =
               params = [li_vp, typ_int; hi_vp, typ_int];
               body = loop_body;
               dbg;
-              is_cold = false
+              is_cold = false;
+              is_bounded = false
             } ],
           (* Start the first iteration of the loop *)
           Cexit
@@ -4773,7 +4774,8 @@ let entry_point namelist =
                       Csequence
                         (call (Cvar id), Cexit (Lbl cont, [incr_i id], [])) );
                 dbg;
-                is_cold = false
+                is_cold = false;
+                is_bounded = false
               } ],
             Cexit (Lbl cont, [cconst_int 0], []) ),
         Ctuple [],
@@ -5056,12 +5058,13 @@ let trywith ~dbg ~body ~exn_var ~extra_args ~handler_cont ~handler () =
           params = (exn_var, typ_val) :: extra_args;
           body = handler;
           dbg;
-          is_cold = false
+          is_cold = false;
+          is_bounded = false
         } ],
       body )
 
-let handler ~dbg label params body is_cold =
-  Cmm.{ label; params; body; dbg; is_cold }
+let handler ?(is_bounded = false) ~dbg label params body is_cold =
+  Cmm.{ label; params; body; dbg; is_cold; is_bounded }
 
 let cexit id args trap_actions = Cmm.Cexit (Cmm.Lbl id, args, trap_actions)
 
